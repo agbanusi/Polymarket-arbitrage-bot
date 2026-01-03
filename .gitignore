@@ -1,0 +1,30 @@
+# Polymarket Arbitrage Bot
+
+# Ignore environment files with secrets
+.env
+.env.local
+.env.*.local
+
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bot
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
