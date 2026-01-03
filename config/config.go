@@ -32,6 +32,9 @@ type Config struct {
 	TakeProfitPercent   float64 // Take profit percentage (0.30 = 30%)
 	TrailingStopPercent float64 // Trailing stop percentage (0 = disabled)
 	MinSpread           float64 // Minimum spread for crypto arb
+	TradingFeePercent   float64 // Round-trip trading fee (0.02 = 2%)
+	MinProfitAfterFees  float64 // Minimum profit after fees to enter (0.03 = 3%)
+	MinLiquidityUSD     float64 // Minimum order book liquidity in USD
 
 	// Sports Strategy
 	SportsEnabled        bool
@@ -104,6 +107,9 @@ func LoadConfig() *Config {
 		TakeProfitPercent:   getEnvFloat("TAKE_PROFIT_PERCENT", 0.40),
 		TrailingStopPercent: getEnvFloat("TRAILING_STOP_PERCENT", 0.0),
 		MinSpread:           getEnvFloat("MIN_SPREAD", 0.05),
+		TradingFeePercent:   getEnvFloat("TRADING_FEE_PERCENT", 0.02),
+		MinProfitAfterFees:  getEnvFloat("MIN_PROFIT_AFTER_FEES", 0.03),
+		MinLiquidityUSD:     getEnvFloat("MIN_LIQUIDITY_USD", 50.0),
 
 		// Sports Strategy
 		SportsEnabled:        getEnvBool("SPORTS_ENABLED", true),

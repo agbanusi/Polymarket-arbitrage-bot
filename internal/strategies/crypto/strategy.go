@@ -432,10 +432,22 @@ func (s *Strategy) executeSpreadArb(tracked *TrackedCryptoMarket) {
 
 	totalCost := (yesPrice * yesSize) + (noPrice * noSize)
 	potentialPayout := yesSize // Both sides give $1 payout per share (whichever wins)
-	guaranteedProfit := potentialPayout - totalCost
+	
+	// CRITICAL: Account for trading fees (round-trip: buy + sell)
+	fees := totalCost * s.Config.TradingFeePercent
+	guaranteedProfit := potentialPayout - totalCost - fees
+	profitPercent := guaranteedProfit / totalCost
+
+	// Check minimum profit threshold after fees
+	if profitPercent < s.Config.MinProfitAfterFees {
+		log.Printf("Crypto: SKIP spread arb - profit %.2f%% below min %.2f%% (fees: $%.4f)",
+			profitPercent*100, s.Config.MinProfitAfterFees*100, fees)
+		return
+	}
 
 	if guaranteedProfit <= 0 {
-		log.Printf("Crypto: No profit in spread arb (cost: $%.4f, payout: $%.4f)", totalCost, potentialPayout)
+		log.Printf("Crypto: No profit in spread arb (cost: $%.4f, payout: $%.4f, fees: $%.4f)", 
+			totalCost, potentialPayout, fees)
 		return
 	}
 

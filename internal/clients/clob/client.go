@@ -109,6 +109,61 @@ func (c *Client) GetOrderBook(tokenID string) (*OrderBook, error) {
 	return &book, nil
 }
 
+// OrderBookWithPrices contains parsed price information from order book
+type OrderBookWithPrices struct {
+	BestBid       float64
+	BestAsk       float64
+	Midpoint      float64
+	BidLiquidity  float64 // Total USD on bid side
+	AskLiquidity  float64 // Total USD on ask side
+}
+
+// GetOrderBookWithPrices fetches order book and parses prices with liquidity info
+func (c *Client) GetOrderBookWithPrices(tokenID string) (*OrderBookWithPrices, error) {
+	book, err := c.GetOrderBook(tokenID)
+	if err != nil {
+		return nil, err
+	}
+
+	result := &OrderBookWithPrices{}
+
+	// API returns bids sorted from WORST to BEST (low to high)
+	// Best bid is LAST element
+	if len(book.Bids) > 0 {
+		lastIdx := len(book.Bids) - 1
+		fmt.Sscanf(book.Bids[lastIdx].Price, "%f", &result.BestBid)
+		
+		// Calculate total bid liquidity
+		for _, level := range book.Bids {
+			var price, size float64
+			fmt.Sscanf(level.Price, "%f", &price)
+			fmt.Sscanf(level.Size, "%f", &size)
+			result.BidLiquidity += price * size
+		}
+	}
+
+	// API returns asks sorted from WORST to BEST (high to low)
+	// Best ask is LAST element
+	if len(book.Asks) > 0 {
+		lastIdx := len(book.Asks) - 1
+		fmt.Sscanf(book.Asks[lastIdx].Price, "%f", &result.BestAsk)
+		
+		// Calculate total ask liquidity
+		for _, level := range book.Asks {
+			var price, size float64
+			fmt.Sscanf(level.Price, "%f", &price)
+			fmt.Sscanf(level.Size, "%f", &size)
+			result.AskLiquidity += price * size
+		}
+	}
+
+	if result.BestBid > 0 && result.BestAsk > 0 {
+		result.Midpoint = (result.BestBid + result.BestAsk) / 2
+	}
+
+	return result, nil
+}
+
 // GetPrice fetches the best price for a token on a specific side
 // This is a PUBLIC endpoint - no authentication required
 func (c *Client) GetPrice(tokenID string, side OrderSide) (float64, error) {

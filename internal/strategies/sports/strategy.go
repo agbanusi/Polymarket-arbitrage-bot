@@ -15,11 +15,12 @@ import (
 
 // Entry thresholds - buy both sides when prices are in these ranges
 const (
-	MaxUnderdogPrice = 0.40 // Buy underdog if < 50%
-	MaxFavoritePrice = 0.65 // Buy favorite if < 65% (since underdog+favorite ≈ 1.0)
-	MinValidPrice    = 0.05 // Minimum price to consider
-	MaxSpreadPercent = 0.50 // Allow wider spreads for sports
-	EntryGracePeriod = 60 * time.Second
+	MaxUnderdogPrice   = 0.35 // Buy underdog if < 35% (tightened from 40%)
+	MaxFavoritePrice   = 0.60 // Buy favorite if < 60% (tightened from 65%)
+	MinValidPrice      = 0.05 // Minimum price to consider
+	MaxSpreadPercent   = 0.50 // Allow wider spreads for sports
+	MaxCombinedPrice   = 0.94 // Combined odds must be < 94% for edge after 2% fees
+	EntryGracePeriod   = 60 * time.Second
 )
 
 // Strategy implements the sports moneyline strategy with delta neutral approach
@@ -510,8 +511,8 @@ func (s *Strategy) analyzeAndTradeDeltaNeutral(tracked *TrackedMarket) {
 	}
 
 	// Check if FAVORITE is in reasonable range for pre-game entry
-	// We want to buy favorite when it's not too expensive (< 80%)
-	favoriteInRange := favoriteMid >= MinValidPrice && favoriteMid <= 0.80
+	// We want to buy favorite when it's not too expensive
+	favoriteInRange := favoriteMid >= MinValidPrice && favoriteMid <= MaxFavoritePrice
 
 	// Check mode: delta neutral (buy both) or single-side (buy favorite only)
 	if s.Config.SportsDeltaNeutral {
@@ -519,14 +520,21 @@ func (s *Strategy) analyzeAndTradeDeltaNeutral(tracked *TrackedMarket) {
 		// This protects against favorite losing (underdog offsets loss)
 		underdogInRange := underdogMid >= MinValidPrice && underdogMid <= MaxUnderdogPrice
 
-		if favoriteInRange && underdogInRange {
+		// CRITICAL: Combined price must leave room for profit after fees (2% round-trip)
+		hasEdge := combinedSpread < MaxCombinedPrice
+		edgePercent := (1.0 - combinedSpread) * 100
+
+		if favoriteInRange && underdogInRange && hasEdge {
 			log.Printf("Sports: 💰 DELTA NEUTRAL PRE-GAME (%s)", tracked.GameStatus)
 			log.Printf("  Market: %s", truncateQuestion(tracked.Market.Question))
 			log.Printf("  %s (favorite): %.4f mid (ask: %.4f) - Will sell when odds → 95-100%%", favoriteName, favoriteMid, favoriteAsk)
 			log.Printf("  %s (underdog): %.4f mid (ask: %.4f) - Hedge position", underdogName, underdogMid, underdogAsk)
-			log.Printf("  Combined: %.4f (%.2f%% edge)", combinedSpread, (1.0-combinedSpread)*100)
+			log.Printf("  Combined: %.4f (%.2f%% edge, min required: %.0f%%)", combinedSpread, edgePercent, (1.0-MaxCombinedPrice)*100)
 
 			s.executeDeltaNeutralEntry(tracked, underdogToken, favoriteToken, underdogAsk, favoriteAsk, underdogMid, favoriteMid, underdogName, favoriteName)
+		} else if favoriteInRange && underdogInRange && !hasEdge {
+			log.Printf("Sports: SKIP %s - combined %.4f exceeds max %.4f (only %.2f%% edge)",
+				truncateQuestion(tracked.Market.Question), combinedSpread, MaxCombinedPrice, edgePercent)
 		}
 	} else {
 		// SINGLE-SIDE MODE: Buy favorite only
@@ -876,14 +884,21 @@ func (s *Strategy) checkExitsForDeltaNeutral(tracked *TrackedMarket, now time.Ti
 }
 
 func (s *Strategy) executeExit(pos *risk.Position) {
+	// Use bid price for exits (what buyers are willing to pay), not midpoint
+	// This ensures the order actually fills
+	bidPrice := pos.CurrentPrice // fallback to current price
+	if book, err := s.ClobClient.GetOrderBookWithPrices(pos.TokenID); err == nil && book.BestBid > 0 {
+		bidPrice = book.BestBid
+	}
+
 	if s.Config.IsDryRun() {
-		pnl := (pos.CurrentPrice - pos.EntryPrice) * pos.Size
-		log.Printf("Sports: [DRY RUN] Would SELL %s @ %.4f (P&L: $%.2f)",
-			pos.OutcomeName, pos.CurrentPrice, pnl)
+		pnl := (bidPrice - pos.EntryPrice) * pos.Size
+		log.Printf("Sports: [DRY RUN] Would SELL %s @ %.4f (bid, P&L: $%.2f)",
+			pos.OutcomeName, bidPrice, pnl)
 	} else {
 		_, err := s.ClobClient.CreateOrder(clob.CreateOrderRequest{
 			TokenID:   pos.TokenID,
-			Price:     pos.CurrentPrice,
+			Price:     bidPrice,
 			Size:      pos.Size,
 			Side:      clob.Sell,
 			OrderType: clob.Limit,

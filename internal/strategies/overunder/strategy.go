@@ -15,10 +15,11 @@ import (
 
 // Entry thresholds for O/U markets
 const (
-	MaxOverPrice     = 0.45 // Buy Over if < 45%
-	MaxUnderPrice    = 0.45 // Buy Under if < 45%
+	MaxOverPrice     = 0.40 // Buy Over if < 40% (tightened from 45%)
+	MaxUnderPrice    = 0.40 // Buy Under if < 40% (tightened from 45%)
 	MinValidPrice    = 0.05
 	MaxSpreadPercent = 0.50
+	MaxCombinedPrice = 0.94 // Combined must be < 94% for edge after fees
 	EntryGracePeriod = 60 * time.Second
 )
 
@@ -348,15 +349,22 @@ func (s *Strategy) analyzeAndTradeDeltaNeutral(tracked *TrackedMarket) {
 	underInRange := tracked.UnderMid >= MinValidPrice && tracked.UnderMid <= MaxUnderPrice
 
 	combinedSpread := tracked.OverMid + tracked.UnderMid
+	
+	// CRITICAL: Combined price must leave room for profit after fees
+	hasEdge := combinedSpread < MaxCombinedPrice
+	edgePercent := (1.0 - combinedSpread) * 100
 
-	if overInRange && underInRange {
+	if overInRange && underInRange && hasEdge {
 		log.Printf("O/U: 💰 DELTA NEUTRAL OPPORTUNITY")
 		log.Printf("  Market: %s", truncateQuestion(tracked.Market.Question))
 		log.Printf("  OVER: %.4f mid (ask: %.4f)", tracked.OverMid, tracked.OverAsk)
 		log.Printf("  UNDER: %.4f mid (ask: %.4f)", tracked.UnderMid, tracked.UnderAsk)
-		log.Printf("  Combined: %.4f (%.2f%% edge)", combinedSpread, (1.0-combinedSpread)*100)
+		log.Printf("  Combined: %.4f (%.2f%% edge, min required: %.0f%%)", combinedSpread, edgePercent, (1.0-MaxCombinedPrice)*100)
 
 		s.executeDeltaNeutralEntry(tracked)
+	} else if overInRange && underInRange && !hasEdge {
+		log.Printf("O/U: SKIP %s - combined %.4f exceeds max %.4f (only %.2f%% edge)",
+			truncateQuestion(tracked.Market.Question), combinedSpread, MaxCombinedPrice, edgePercent)
 	}
 }
 
@@ -528,14 +536,20 @@ func (s *Strategy) checkExitsForDeltaNeutral(tracked *TrackedMarket, now time.Ti
 }
 
 func (s *Strategy) executeExit(pos *risk.Position) {
+	// Use bid price for exits (what buyers are willing to pay), not midpoint
+	bidPrice := pos.CurrentPrice // fallback
+	if book, err := s.ClobClient.GetOrderBookWithPrices(pos.TokenID); err == nil && book.BestBid > 0 {
+		bidPrice = book.BestBid
+	}
+
 	if s.Config.IsDryRun() {
-		pnl := (pos.CurrentPrice - pos.EntryPrice) * pos.Size
-		log.Printf("O/U: [DRY RUN] Would SELL %s @ %.4f (P&L: $%.2f)",
-			pos.OutcomeName, pos.CurrentPrice, pnl)
+		pnl := (bidPrice - pos.EntryPrice) * pos.Size
+		log.Printf("O/U: [DRY RUN] Would SELL %s @ %.4f (bid, P&L: $%.2f)",
+			pos.OutcomeName, bidPrice, pnl)
 	} else {
 		_, err := s.ClobClient.CreateOrder(clob.CreateOrderRequest{
 			TokenID:   pos.TokenID,
-			Price:     pos.CurrentPrice,
+			Price:     bidPrice,
 			Size:      pos.Size,
 			Side:      clob.Sell,
 			OrderType: clob.Limit,
