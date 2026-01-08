@@ -38,25 +38,25 @@ type Config struct {
 
 	// Sports Strategy
 	SportsEnabled        bool
-	SportsOUEnabled      bool    // Enable O/U strategy
-	SportsEntryThreshold float64 // Entry price for underdog (e.g., 0.35)
-	SportsExitTarget     float64 // Exit target price (e.g., 0.45)
-	SportsDeltaNeutral   bool    // Enable delta neutral mode
+	SportsOUEnabled      bool     // Enable O/U strategy
+	SportsEntryThreshold float64  // Entry price for underdog (e.g., 0.35)
+	SportsExitTarget     float64  // Exit target price (e.g., 0.45)
+	SportsDeltaNeutral   bool     // Enable delta neutral mode
 	SportsTags           []string // Tags to search for (NBA, NFL, etc.)
 
 	// Crypto Strategy
 	CryptoEnabled        bool
-	CryptoCheapThreshold float64   // Entry threshold (e.g., 0.40)
-	CryptoMaxSpread      float64   // Max combined Yes+No price (e.g., 0.99)
-	CryptoMinTimeLeft    int       // Min seconds before expiry
-	CryptoSymbols        []string  // BTC, ETH, SOL
-	CryptoTimeWindows    []string  // Time windows to trade: "15min", "1hr", "4hr"
-	
+	CryptoCheapThreshold float64  // Entry threshold (e.g., 0.40)
+	CryptoMaxSpread      float64  // Max combined Yes+No price (e.g., 0.99)
+	CryptoMinTimeLeft    int      // Min seconds before expiry
+	CryptoSymbols        []string // BTC, ETH, SOL
+	CryptoTimeWindows    []string // Time windows to trade: "15min", "1hr", "4hr"
+
 	// Sports Live Game Settings
-	SportsLiveGameOnly     bool    // Only trade during live games
-	SportsOddsShiftMin     float64 // Min odds shift to trigger entry (e.g., 0.10 = 10%)
-	SportsOddsHistorySize  int     // Number of price points to track for momentum
-	SportsLateGameMinOdds  float64 // Min odds for late-game favorite entry (e.g., 0.85)
+	SportsLiveGameOnly    bool    // Only trade during live games
+	SportsOddsShiftMin    float64 // Min odds shift to trigger entry (e.g., 0.10 = 10%)
+	SportsOddsHistorySize int     // Number of price points to track for momentum
+	SportsLateGameMinOdds float64 // Min odds for late-game favorite entry (e.g., 0.85)
 
 	// Monitoring
 	PriceUpdateInterval int // Seconds between price updates
@@ -108,36 +108,36 @@ func LoadConfig() *Config {
 		TrailingStopPercent: getEnvFloat("TRAILING_STOP_PERCENT", 0.0),
 		MinSpread:           getEnvFloat("MIN_SPREAD", 0.05),
 		TradingFeePercent:   getEnvFloat("TRADING_FEE_PERCENT", 0.02),
-		MinProfitAfterFees:  getEnvFloat("MIN_PROFIT_AFTER_FEES", 0.03),
+		MinProfitAfterFees:  getEnvFloat("MIN_PROFIT_AFTER_FEES", 0.01),
 		MinLiquidityUSD:     getEnvFloat("MIN_LIQUIDITY_USD", 50.0),
 
 		// Sports Strategy
-		SportsEnabled:        getEnvBool("SPORTS_ENABLED", true),
-		SportsOUEnabled:      getEnvBool("SPORTS_OU_ENABLED", true),
+		SportsEnabled:        getEnvBool("SPORTS_ENABLED", false),
+		SportsOUEnabled:      getEnvBool("SPORTS_OU_ENABLED", false),
 		SportsEntryThreshold: getEnvFloat("SPORTS_ENTRY_THRESHOLD", 0.25),
 		SportsExitTarget:     getEnvFloat("SPORTS_EXIT_TARGET", 0.55),
 		SportsDeltaNeutral:   getEnvBool("SPORTS_DELTA_NEUTRAL", true), // Default: buy both sides for protection
-		SportsTags:           getEnvSlice("SPORTS_TAGS", []string{
-			"NBA", "NFL", "MLB", // "NHL",
+		SportsTags: getEnvSlice("SPORTS_TAGS", []string{
+			"NBA", "NFL", "MLB", "NHL",
 			// "Soccer", "Football",
-			"EPL", "English Premier League",
+			"EPL", "laliga",
 			// "La Liga", "Serie A", "Bundesliga", "Ligue 1",
-			"Champions League", "UEFA", //"MLS",
+			// "Champions League", "UEFA", //"MLS",
 		}),
 
 		// Crypto Strategy - SHORT-TERM ONLY (15min/1hr/4hr)
 		CryptoEnabled:        getEnvBool("CRYPTO_ENABLED", true),
-		CryptoCheapThreshold: getEnvFloat("CRYPTO_CHEAP_THRESHOLD", 0.25),
+		CryptoCheapThreshold: getEnvFloat("CRYPTO_CHEAP_THRESHOLD", 0.45),
 		CryptoMaxSpread:      getEnvFloat("CRYPTO_MAX_SPREAD", 0.99),
 		CryptoMinTimeLeft:    getEnvInt("CRYPTO_MIN_TIME_LEFT", 120),
 		CryptoSymbols:        getEnvSlice("CRYPTO_SYMBOLS", []string{"BTC", "ETH", "SOL"}),
 		CryptoTimeWindows:    getEnvSlice("CRYPTO_TIME_WINDOWS", []string{"15min", "1hr", "4hr"}),
-		
+
 		// Sports Live Game Settings
-		SportsLiveGameOnly:     getEnvBool("SPORTS_LIVE_GAME_ONLY", false),
-		SportsOddsShiftMin:     getEnvFloat("SPORTS_ODDS_SHIFT_MIN", 0.10),
-		SportsOddsHistorySize:  getEnvInt("SPORTS_ODDS_HISTORY_SIZE", 10),
-		SportsLateGameMinOdds:  getEnvFloat("SPORTS_LATE_GAME_MIN_ODDS", 0.85),
+		SportsLiveGameOnly:    getEnvBool("SPORTS_LIVE_GAME_ONLY", false),
+		SportsOddsShiftMin:    getEnvFloat("SPORTS_ODDS_SHIFT_MIN", 0.10),
+		SportsOddsHistorySize: getEnvInt("SPORTS_ODDS_HISTORY_SIZE", 10),
+		SportsLateGameMinOdds: getEnvFloat("SPORTS_LATE_GAME_MIN_ODDS", 0.85),
 
 		// Monitoring
 		PriceUpdateInterval: getEnvInt("PRICE_UPDATE_INTERVAL", 5),
@@ -172,9 +172,9 @@ func (c *Config) LogConfig() {
 	log.Printf("Max Position Size: $%.2f", c.MaxPositionSize)
 	log.Printf("Stop Loss: %.0f%%", c.StopLossPercent*100)
 	log.Printf("Take Profit: %.0f%%", c.TakeProfitPercent*100)
-	log.Printf("Sports Enabled: %v (Entry: %.3f, Exit: %.3f, Tags: %v)", 
+	log.Printf("Sports Enabled: %v (Entry: %.3f, Exit: %.3f, Tags: %v)",
 		c.SportsEnabled, c.SportsEntryThreshold, c.SportsExitTarget, c.SportsTags)
-	log.Printf("Crypto Enabled: %v (Threshold: %.2f, Symbols: %v)", 
+	log.Printf("Crypto Enabled: %v (Threshold: %.2f, Symbols: %v)",
 		c.CryptoEnabled, c.CryptoCheapThreshold, c.CryptoSymbols)
 	log.Println("=========================")
 }

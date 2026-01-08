@@ -21,7 +21,7 @@ const (
 type PositionType string
 
 const (
-	TypeValueBet    PositionType = "VALUE_BET"     // Single side bet
+	TypeValueBet     PositionType = "VALUE_BET"     // Single side bet
 	TypeDeltaNeutral PositionType = "DELTA_NEUTRAL" // Both sides
 	TypeArbitrage    PositionType = "ARBITRAGE"     // Crypto spread arb
 )
@@ -35,27 +35,32 @@ const (
 
 // Position represents an open position
 type Position struct {
-	ID            string        // Unique position ID
-	MarketID      string        // Gamma market ID
-	TokenID       string        // CLOB token ID (Yes or No token)
-	OutcomeIndex  int           // 0=Yes/TeamA, 1=No/TeamB
-	OutcomeName   string        // "Yes", "No", or team name
-	Size          float64       // Number of shares
-	EntryPrice    float64       // Average entry price
-	CurrentPrice  float64       // Latest price
-	HighestPrice  float64       // Highest price seen (for trailing stop)
-	StopLossPrice float64       // Calculated stop loss price
-	TakeProfitPrice float64     // Calculated take profit price
-	Side          string        // "BUY" or "SELL"
-	State         PositionState
-	Type          PositionType
-	Strategy      string        // "sports" or "crypto"
-	EntryTime     time.Time
-	LastUpdate    time.Time
-	
+	ID              string  // Unique position ID
+	MarketID        string  // Gamma market ID
+	TokenID         string  // CLOB token ID (Yes or No token)
+	OutcomeIndex    int     // 0=Yes/TeamA, 1=No/TeamB
+	OutcomeName     string  // "Yes", "No", or team name
+	Size            float64 // Number of shares
+	EntryPrice      float64 // Average entry price
+	CurrentPrice    float64 // Latest price
+	HighestPrice    float64 // Highest price seen (for trailing stop)
+	StopLossPrice   float64 // Calculated stop loss price
+	TakeProfitPrice float64 // Calculated take profit price
+	Side            string  // "BUY" or "SELL"
+	State           PositionState
+	Type            PositionType
+	Strategy        string // "sports" or "crypto"
+	EntryTime       time.Time
+	LastUpdate      time.Time
+
 	// For delta neutral / arb
 	PairedPositionID string  // ID of the paired position
 	TotalCost        float64 // Combined cost for arb
+
+	// Settlement tracking
+	ResolvedAt time.Time // When market resolved
+	FinalPnL   float64   // Final realized P&L after resolution
+	WonBet     bool      // Whether this position won
 }
 
 // Manager handles risk management
@@ -63,10 +68,13 @@ type Manager struct {
 	Config    *config.Config
 	Positions map[string]*Position
 	mu        sync.RWMutex
-	
+
 	// Callbacks for position events
 	OnStopLoss   func(pos *Position)
 	OnTakeProfit func(pos *Position)
+
+	// Realized P&L tracking
+	RealizedPnL float64
 }
 
 // NewManager creates a new risk manager
@@ -152,12 +160,12 @@ func (m *Manager) CanAddPosition() bool {
 func (m *Manager) CanAddPositionForStrategy(strategy string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	
+
 	// Check total limit first
 	if m.getOpenPositionCountUnsafe() >= MaxPositions {
 		return false
 	}
-	
+
 	// Check per-strategy limits
 	count := m.getPositionCountByStrategyUnsafe(strategy)
 	switch strategy {
@@ -178,12 +186,12 @@ func (m *Manager) AddPosition(pos *Position) string {
 	if pos.ID == "" {
 		pos.ID = fmt.Sprintf("pos_%d", time.Now().UnixNano())
 	}
-	
+
 	pos.State = StateOpen
 	pos.EntryTime = time.Now()
 	pos.LastUpdate = time.Now()
 	pos.HighestPrice = pos.EntryPrice
-	
+
 	// Calculate stop loss and take profit prices
 	if pos.Side == "BUY" {
 		pos.StopLossPrice = pos.EntryPrice * (1 - m.Config.StopLossPercent)
@@ -194,10 +202,10 @@ func (m *Manager) AddPosition(pos *Position) string {
 	}
 
 	m.Positions[pos.ID] = pos
-	
-	log.Printf("Risk: Added position %s - %s @ %.4f (SL: %.4f, TP: %.4f)", 
+
+	log.Printf("Risk: Added position %s - %s @ %.4f (SL: %.4f, TP: %.4f)",
 		pos.ID, pos.OutcomeName, pos.EntryPrice, pos.StopLossPrice, pos.TakeProfitPrice)
-	
+
 	return pos.ID
 }
 
@@ -226,7 +234,7 @@ func (m *Manager) UpdatePrice(tokenID string, price float64) []ExitSignal {
 		if pos.TokenID == tokenID && pos.State == StateOpen {
 			pos.CurrentPrice = price
 			pos.LastUpdate = time.Now()
-			
+
 			// Update highest price for trailing stop
 			if price > pos.HighestPrice {
 				pos.HighestPrice = price
@@ -270,7 +278,7 @@ func (m *Manager) checkExitConditions(pos *Position) *ExitSignal {
 	} else {
 		pnlPercent = (pos.EntryPrice - pos.CurrentPrice) / pos.EntryPrice
 	}
-	
+
 	pnl := (pos.CurrentPrice - pos.EntryPrice) * pos.Size
 	if pos.Side == "SELL" {
 		pnl = -pnl
@@ -287,7 +295,7 @@ func (m *Manager) checkExitConditions(pos *Position) *ExitSignal {
 			PnLPercent: pnlPercent,
 		}
 	}
-	
+
 	if pos.Side == "SELL" && pos.CurrentPrice >= pos.StopLossPrice {
 		pos.State = StatePendingExit
 		return &ExitSignal{
@@ -310,7 +318,7 @@ func (m *Manager) checkExitConditions(pos *Position) *ExitSignal {
 			PnLPercent: pnlPercent,
 		}
 	}
-	
+
 	if pos.Side == "SELL" && pos.CurrentPrice <= pos.TakeProfitPrice {
 		pos.State = StatePendingExit
 		return &ExitSignal{
@@ -336,7 +344,7 @@ func (m *Manager) GetPosition(positionID string) *Position {
 func (m *Manager) GetPositionByToken(tokenID string) []*Position {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	
+
 	var positions []*Position
 	for _, pos := range m.Positions {
 		if pos.TokenID == tokenID && pos.State == StateOpen {
@@ -350,7 +358,7 @@ func (m *Manager) GetPositionByToken(tokenID string) []*Position {
 func (m *Manager) GetOpenPositions() []*Position {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	
+
 	var positions []*Position
 	for _, pos := range m.Positions {
 		if pos.State == StateOpen {
@@ -364,7 +372,7 @@ func (m *Manager) GetOpenPositions() []*Position {
 func (m *Manager) GetPositionsByStrategy(strategy string) []*Position {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	
+
 	var positions []*Position
 	for _, pos := range m.Positions {
 		if pos.Strategy == strategy && pos.State == StateOpen {
@@ -378,7 +386,7 @@ func (m *Manager) GetPositionsByStrategy(strategy string) []*Position {
 func (m *Manager) ClosePosition(positionID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
 	if pos, exists := m.Positions[positionID]; exists {
 		pos.State = StateClosed
 		log.Printf("Risk: Closed position %s", positionID)
@@ -413,7 +421,7 @@ func (m *Manager) getTotalExposureUnsafe() float64 {
 func (m *Manager) GetTotalPnL() float64 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	
+
 	var total float64
 	for _, pos := range m.Positions {
 		if pos.State == StateOpen && pos.CurrentPrice > 0 {
@@ -431,7 +439,7 @@ func (m *Manager) GetTotalPnL() float64 {
 func (m *Manager) HasPositionForMarket(marketID string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	
+
 	for _, pos := range m.Positions {
 		if pos.MarketID == marketID && pos.State == StateOpen {
 			return true
@@ -444,11 +452,11 @@ func (m *Manager) HasPositionForMarket(marketID string) bool {
 func (m *Manager) GetPositionSummary() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	
+
 	openCount := 0
 	totalExposure := 0.0
 	totalPnL := 0.0
-	
+
 	for _, pos := range m.Positions {
 		if pos.State == StateOpen {
 			openCount++
@@ -462,8 +470,8 @@ func (m *Manager) GetPositionSummary() string {
 			}
 		}
 	}
-	
-	return fmt.Sprintf("Positions: %d/%d | Exposure: $%.2f | Unrealized P&L: $%.2f", 
+
+	return fmt.Sprintf("Positions: %d/%d | Exposure: $%.2f | Unrealized P&L: $%.2f",
 		openCount, MaxPositions, totalExposure, totalPnL)
 }
 
@@ -471,22 +479,22 @@ func (m *Manager) GetPositionSummary() string {
 func (m *Manager) GetDetailedReport() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	
+
 	var report string
 	report = "\n╔════════════════════════════════════════════════════════════════════╗\n"
 	report += "║                    POSITION REPORT                                 ║\n"
 	report += "╠════════════════════════════════════════════════════════════════════╣\n"
 	report += fmt.Sprintf("║  Time: %s                                   ║\n", time.Now().Format("2006-01-02 15:04:05"))
 	report += "╠════════════════════════════════════════════════════════════════════╣\n"
-	
+
 	// Group by strategy
 	cryptoPositions := []*Position{}
 	sportsPositions := []*Position{}
 	ouPositions := []*Position{}
-	
+
 	totalPnL := 0.0
 	totalExposure := 0.0
-	
+
 	for _, pos := range m.Positions {
 		if pos.State != StateOpen {
 			continue
@@ -499,7 +507,7 @@ func (m *Manager) GetDetailedReport() string {
 		case "overunder":
 			ouPositions = append(ouPositions, pos)
 		}
-		
+
 		exposure := pos.EntryPrice * pos.Size
 		totalExposure += exposure
 		if pos.CurrentPrice > 0 {
@@ -510,7 +518,7 @@ func (m *Manager) GetDetailedReport() string {
 			totalPnL += pnl
 		}
 	}
-	
+
 	// Crypto positions
 	if len(cryptoPositions) > 0 {
 		report += fmt.Sprintf("║ 🪙  CRYPTO (%d positions)                                          ║\n", len(cryptoPositions))
@@ -526,7 +534,7 @@ func (m *Manager) GetDetailedReport() string {
 				pos.OutcomeName, truncateStr(pos.MarketID, 8), pos.EntryPrice, pos.CurrentPrice, symbol, pnl, pnlPercent)
 		}
 	}
-	
+
 	// Sports positions
 	if len(sportsPositions) > 0 {
 		report += "╟────────────────────────────────────────────────────────────────────╢\n"
@@ -543,7 +551,7 @@ func (m *Manager) GetDetailedReport() string {
 				truncateStr(pos.OutcomeName, 15), pos.EntryPrice, pos.CurrentPrice, symbol, pnl, pnlPercent)
 		}
 	}
-	
+
 	// O/U positions
 	if len(ouPositions) > 0 {
 		report += "╟────────────────────────────────────────────────────────────────────╢\n"
@@ -560,7 +568,7 @@ func (m *Manager) GetDetailedReport() string {
 				truncateStr(pos.OutcomeName, 15), pos.EntryPrice, pos.CurrentPrice, symbol, pnl, pnlPercent)
 		}
 	}
-	
+
 	// Summary
 	report += "╠════════════════════════════════════════════════════════════════════╣\n"
 	totalPositions := len(cryptoPositions) + len(sportsPositions) + len(ouPositions)
@@ -568,14 +576,14 @@ func (m *Manager) GetDetailedReport() string {
 	if totalPnL < 0 {
 		pnlSymbol = "📉"
 	}
-	report += fmt.Sprintf("║  TOTAL: %d/%d positions | Exposure: $%.2f | %s P&L: $%.2f\n", 
+	report += fmt.Sprintf("║  TOTAL: %d/%d positions | Exposure: $%.2f | %s P&L: $%.2f\n",
 		totalPositions, MaxPositions, totalExposure, pnlSymbol, totalPnL)
 	report += "╚════════════════════════════════════════════════════════════════════╝\n"
-	
+
 	if totalPositions == 0 {
 		return "\n📊 POSITION REPORT: No open positions\n"
 	}
-	
+
 	return report
 }
 
@@ -584,4 +592,63 @@ func truncateStr(s string, maxLen int) string {
 		return s[:maxLen-3] + "..."
 	}
 	return s
+}
+
+// SettlePosition marks a position as resolved with final P&L
+func (m *Manager) SettlePosition(positionID string, won bool, finalPnL float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if pos, exists := m.Positions[positionID]; exists {
+		pos.State = StateClosed
+		pos.WonBet = won
+		pos.FinalPnL = finalPnL
+		pos.ResolvedAt = time.Now()
+		m.RealizedPnL += finalPnL
+
+		log.Printf("Risk: Settled position %s - Won: %v, P&L: $%.2f, Total Realized: $%.2f",
+			positionID, won, finalPnL, m.RealizedPnL)
+	}
+}
+
+// GetRealizedPnL returns total realized P&L from closed positions
+func (m *Manager) GetRealizedPnL() float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.RealizedPnL
+}
+
+// GetPositionsByMarket returns all positions for a specific market ID
+func (m *Manager) GetPositionsByMarket(marketID string) []*Position {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var positions []*Position
+	for _, pos := range m.Positions {
+		if pos.MarketID == marketID {
+			positions = append(positions, pos)
+		}
+	}
+	return positions
+}
+
+// CleanupStalePositions removes positions closed more than 24 hours ago
+func (m *Manager) CleanupStalePositions() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cleaned := 0
+	cutoff := time.Now().Add(-24 * time.Hour)
+
+	for id, pos := range m.Positions {
+		if pos.State == StateClosed && !pos.ResolvedAt.IsZero() && pos.ResolvedAt.Before(cutoff) {
+			delete(m.Positions, id)
+			cleaned++
+		}
+	}
+
+	if cleaned > 0 {
+		log.Printf("Risk: Cleaned up %d stale closed positions", cleaned)
+	}
+	return cleaned
 }

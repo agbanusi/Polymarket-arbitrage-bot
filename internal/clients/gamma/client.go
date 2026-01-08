@@ -32,26 +32,26 @@ type ClobTokenPair struct {
 
 // Market represents a Polymarket market from Gamma API
 type Market struct {
-	ID               string   `json:"id"`
-	Question         string   `json:"question"`
-	Slug             string   `json:"slug"`
-	EndDate          string   `json:"endDate"`
-	Volume           string   `json:"volume"`
-	Volume24hr       float64  `json:"volume24hr"`
-	Active           bool     `json:"active"`
-	Closed           bool     `json:"closed"`
-	Tags             []Tag    `json:"tags"`
-	Outcomes         string   `json:"outcomes"` // JSON array string e.g. "[\"Yes\", \"No\"]"
-	OutcomePrices    string   `json:"outcomePrices"` // JSON array string e.g. "[\"0.65\", \"0.35\"]"
-	Description      string   `json:"description"`
-	ConditionID      string   `json:"conditionId"`
-	QuestionID       string   `json:"questionId"`
-	ClobTokenIds     string   `json:"clobTokenIds"` // JSON array of token IDs
-	ResolutionSource string   `json:"resolutionSource"`
-	EndDateIso       string   `json:"endDateIso"`
-	GameStartTime    string   `json:"gameStartTime,omitempty"`
-	EnableOrderBook  bool     `json:"enableOrderBook"`
-	SportsMarketType string   `json:"sportsMarketType,omitempty"` // "moneyline", "spreads", "totals"
+	ID               string  `json:"id"`
+	Question         string  `json:"question"`
+	Slug             string  `json:"slug"`
+	EndDate          string  `json:"endDate"`
+	Volume           string  `json:"volume"`
+	Volume24hr       float64 `json:"volume24hr"`
+	Active           bool    `json:"active"`
+	Closed           bool    `json:"closed"`
+	Tags             []Tag   `json:"tags"`
+	Outcomes         string  `json:"outcomes"`      // JSON array string e.g. "[\"Yes\", \"No\"]"
+	OutcomePrices    string  `json:"outcomePrices"` // JSON array string e.g. "[\"0.65\", \"0.35\"]"
+	Description      string  `json:"description"`
+	ConditionID      string  `json:"conditionId"`
+	QuestionID       string  `json:"questionId"`
+	ClobTokenIds     string  `json:"clobTokenIds"` // JSON array of token IDs
+	ResolutionSource string  `json:"resolutionSource"`
+	EndDateIso       string  `json:"endDateIso"`
+	GameStartTime    string  `json:"gameStartTime,omitempty"`
+	EnableOrderBook  bool    `json:"enableOrderBook"`
+	SportsMarketType string  `json:"sportsMarketType,omitempty"` // "moneyline", "spreads", "totals"
 }
 
 // Tag represents a market tag
@@ -146,15 +146,15 @@ func (m *Market) HasTag(tagLabel string) bool {
 }
 
 type GetMarketsParams struct {
-	Limit            int
-	Offset           int
-	Order            string // "volume", "created_at", "id"
-	Ascending        bool
-	Tag              string
-	TagID            string
-	Active           bool
-	Closed           bool
-	Slug             string
+	Limit             int
+	Offset            int
+	Order             string // "volume", "created_at", "id"
+	Ascending         bool
+	Tag               string
+	TagID             string
+	Active            bool
+	Closed            bool
+	Slug              string
 	SportsMarketTypes string // "moneyline", "spreads", "totals", etc.
 }
 
@@ -241,6 +241,37 @@ func (c *Client) GetMarketBySlug(slug string) (*Market, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("gamma market API returned status: %d", resp.StatusCode)
+	}
+
+	var market Market
+	if err := json.NewDecoder(resp.Body).Decode(&market); err != nil {
+		return nil, err
+	}
+
+	return &market, nil
+}
+
+// GetMarketByID fetches a single market by its ID
+func (c *Client) GetMarketByID(marketID string) (*Market, error) {
+	endpoint := fmt.Sprintf("%s/markets/%s", c.BaseURL, marketID)
+
+	req, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil // Market not found
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("gamma market API returned status: %d", resp.StatusCode)

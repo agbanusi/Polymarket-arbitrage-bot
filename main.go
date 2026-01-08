@@ -59,9 +59,19 @@ func main() {
 	log.Println("Initializing risk manager...")
 	riskManager := risk.NewManager(cfg)
 
+	// 4b. Load persisted positions (for crash recovery)
+	positionsFile := risk.GetPositionsFilePath()
+	if err := riskManager.LoadPositions(positionsFile); err != nil {
+		log.Printf("Warning: Could not load positions: %v", err)
+	}
+
 	// 5. Initialize Position Monitor
 	log.Println("Initializing position monitor...")
 	positionMonitor := services.NewPositionMonitor(cfg, clobClient, riskManager)
+
+	// 5b. Initialize Settlement Service (for market resolution detection)
+	log.Println("Initializing settlement service...")
+	settlementService := services.NewSettlementService(cfg, gammaClient, clobClient, riskManager)
 
 	// 6. Initialize Strategies
 	log.Println("Initializing strategies...")
@@ -74,15 +84,19 @@ func main() {
 
 	// 8. Start all components in goroutines
 	log.Println("Starting bot components...")
-	
+
 	// Start position monitor
 	go positionMonitor.Run()
+
+	// Start settlement service (checks for resolved markets every 5 minutes)
+	go settlementService.Run()
+	log.Println("✅ Settlement service started")
 
 	// Start strategies
 	if cfg.SportsEnabled {
 		go sportsStrategy.Run()
 		log.Println("✅ Sports MONEYLINE strategy started")
-		
+
 		go ouStrategy.Run()
 		log.Println("✅ Sports OVER/UNDER strategy started")
 	} else {
@@ -112,21 +126,28 @@ func main() {
 	<-stop
 
 	log.Println("\n🛑 Shutdown signal received...")
-	
+
 	// Graceful shutdown
 	cancel()
-	
+
 	// Stop strategies
 	sportsStrategy.Stop()
 	ouStrategy.Stop()
 	cryptoStrategy.Stop()
 	positionMonitor.Stop()
-	
+	settlementService.Stop()
+
 	// Close connections
 	rtdsClient.Close()
 
+	// Save positions for crash recovery
+	if err := riskManager.SavePositions(positionsFile); err != nil {
+		log.Printf("Warning: Could not save positions: %v", err)
+	}
+
 	log.Println("Final position summary:")
 	log.Println(riskManager.GetPositionSummary())
+	log.Printf("Total Realized P&L: $%.2f", riskManager.GetRealizedPnL())
 	log.Println("Bot shutdown complete.")
 }
 
@@ -175,4 +196,3 @@ func logPeriodicStatus(ctx context.Context, sportsStrat *sports.Strategy, ouStra
 		}
 	}
 }
-

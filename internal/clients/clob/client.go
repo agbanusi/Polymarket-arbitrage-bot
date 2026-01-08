@@ -2,6 +2,9 @@ package clob
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -58,12 +61,12 @@ type PriceLevel struct {
 
 // OrderBook represents the order book for a token
 type OrderBook struct {
-	Market       string       `json:"market"`
-	AssetID      string       `json:"asset_id"`
-	Bids         []PriceLevel `json:"bids"`
-	Asks         []PriceLevel `json:"asks"`
-	Timestamp    string       `json:"timestamp"`
-	Hash         string       `json:"hash"`
+	Market    string       `json:"market"`
+	AssetID   string       `json:"asset_id"`
+	Bids      []PriceLevel `json:"bids"`
+	Asks      []PriceLevel `json:"asks"`
+	Timestamp string       `json:"timestamp"`
+	Hash      string       `json:"hash"`
 }
 
 // PriceResponse represents a price query response
@@ -111,11 +114,11 @@ func (c *Client) GetOrderBook(tokenID string) (*OrderBook, error) {
 
 // OrderBookWithPrices contains parsed price information from order book
 type OrderBookWithPrices struct {
-	BestBid       float64
-	BestAsk       float64
-	Midpoint      float64
-	BidLiquidity  float64 // Total USD on bid side
-	AskLiquidity  float64 // Total USD on ask side
+	BestBid      float64
+	BestAsk      float64
+	Midpoint     float64
+	BidLiquidity float64 // Total USD on bid side
+	AskLiquidity float64 // Total USD on ask side
 }
 
 // GetOrderBookWithPrices fetches order book and parses prices with liquidity info
@@ -132,7 +135,7 @@ func (c *Client) GetOrderBookWithPrices(tokenID string) (*OrderBookWithPrices, e
 	if len(book.Bids) > 0 {
 		lastIdx := len(book.Bids) - 1
 		fmt.Sscanf(book.Bids[lastIdx].Price, "%f", &result.BestBid)
-		
+
 		// Calculate total bid liquidity
 		for _, level := range book.Bids {
 			var price, size float64
@@ -147,7 +150,7 @@ func (c *Client) GetOrderBookWithPrices(tokenID string) (*OrderBookWithPrices, e
 	if len(book.Asks) > 0 {
 		lastIdx := len(book.Asks) - 1
 		fmt.Sscanf(book.Asks[lastIdx].Price, "%f", &result.BestAsk)
-		
+
 		// Calculate total ask liquidity
 		for _, level := range book.Asks {
 			var price, size float64
@@ -329,12 +332,40 @@ func (c *Client) CancelOrder(orderID string) error {
 func (c *Client) setAuthHeaders(req *http.Request) {
 	req.Header.Set("Content-Type", "application/json")
 	if c.APIKey != "" {
+		timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
+
+		// Build message to sign: timestamp + method + path + body
+		message := timestamp + req.Method + req.URL.Path
+		if req.URL.RawQuery != "" {
+			message += "?" + req.URL.RawQuery
+		}
+
+		// Add body if present
+		if req.Body != nil {
+			body, err := io.ReadAll(req.Body)
+			if err == nil && len(body) > 0 {
+				req.Body = io.NopCloser(bytes.NewBuffer(body))
+				message += string(body)
+			}
+		}
+
+		// Generate HMAC-SHA256 signature
+		decodedSecret, err := base64.StdEncoding.DecodeString(c.Secret)
+		var signature string
+		if err != nil {
+			// If secret is not base64-encoded, use it directly
+			h := hmac.New(sha256.New, []byte(c.Secret))
+			h.Write([]byte(message))
+			signature = base64.StdEncoding.EncodeToString(h.Sum(nil))
+		} else {
+			h := hmac.New(sha256.New, decodedSecret)
+			h.Write([]byte(message))
+			signature = base64.StdEncoding.EncodeToString(h.Sum(nil))
+		}
+
 		req.Header.Set("POLY_API_KEY", c.APIKey)
 		req.Header.Set("POLY_PASSPHRASE", c.Passphrase)
-		req.Header.Set("POLY_SECRET", c.Secret)
-		// TODO: Add proper HMAC signature for authenticated requests
-		// timestamp := strconv.FormatInt(time.Now().Unix(), 10)
-		// req.Header.Set("POLY_TIMESTAMP", timestamp)
-		// req.Header.Set("POLY_SIGNATURE", generateSignature(...))
+		req.Header.Set("POLY_TIMESTAMP", timestamp)
+		req.Header.Set("POLY_SIGNATURE", signature)
 	}
 }
