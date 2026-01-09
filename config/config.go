@@ -104,7 +104,7 @@ func LoadConfig() *Config {
 		MaxPositionSize:     getEnvFloat("MAX_POSITION_SIZE", 5.0),
 		MaxTotalExposure:    getEnvFloat("MAX_TOTAL_EXPOSURE", 200.0),
 		StopLossPercent:     getEnvFloat("STOP_LOSS_PERCENT", 0.20),
-		TakeProfitPercent:   getEnvFloat("TAKE_PROFIT_PERCENT", 0.40),
+		TakeProfitPercent:   getEnvFloat("TAKE_PROFIT_PERCENT", 0.50),
 		TrailingStopPercent: getEnvFloat("TRAILING_STOP_PERCENT", 0.0),
 		MinSpread:           getEnvFloat("MIN_SPREAD", 0.05),
 		TradingFeePercent:   getEnvFloat("TRADING_FEE_PERCENT", 0.02),
@@ -112,8 +112,8 @@ func LoadConfig() *Config {
 		MinLiquidityUSD:     getEnvFloat("MIN_LIQUIDITY_USD", 50.0),
 
 		// Sports Strategy
-		SportsEnabled:        getEnvBool("SPORTS_ENABLED", false),
-		SportsOUEnabled:      getEnvBool("SPORTS_OU_ENABLED", false),
+		SportsEnabled:        getEnvBool("SPORTS_ENABLED", true),
+		SportsOUEnabled:      getEnvBool("SPORTS_OU_ENABLED", true),
 		SportsEntryThreshold: getEnvFloat("SPORTS_ENTRY_THRESHOLD", 0.25),
 		SportsExitTarget:     getEnvFloat("SPORTS_EXIT_TARGET", 0.55),
 		SportsDeltaNeutral:   getEnvBool("SPORTS_DELTA_NEUTRAL", true), // Default: buy both sides for protection
@@ -134,7 +134,7 @@ func LoadConfig() *Config {
 		CryptoTimeWindows:    getEnvSlice("CRYPTO_TIME_WINDOWS", []string{"15min", "1hr", "4hr"}),
 
 		// Sports Live Game Settings
-		SportsLiveGameOnly:    getEnvBool("SPORTS_LIVE_GAME_ONLY", false),
+		SportsLiveGameOnly:    getEnvBool("SPORTS_LIVE_GAME_ONLY", true),
 		SportsOddsShiftMin:    getEnvFloat("SPORTS_ODDS_SHIFT_MIN", 0.10),
 		SportsOddsHistorySize: getEnvInt("SPORTS_ODDS_HISTORY_SIZE", 10),
 		SportsLateGameMinOdds: getEnvFloat("SPORTS_LATE_GAME_MIN_ODDS", 0.85),

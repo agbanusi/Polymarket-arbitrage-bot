@@ -14,12 +14,12 @@ import (
 )
 
 // Entry thresholds for O/U markets
+// Profit comes from selling at different times as game total shifts
 const (
-	MaxOverPrice     = 0.40 // Buy Over if < 40% (tightened from 45%)
-	MaxUnderPrice    = 0.40 // Buy Under if < 40% (tightened from 45%)
+	MaxOverPrice     = 0.50 // Buy Over if < 50%
+	MaxUnderPrice    = 0.50 // Buy Under if < 50%
 	MinValidPrice    = 0.05
 	MaxSpreadPercent = 0.50
-	MaxCombinedPrice = 0.94 // Combined must be < 94% for edge after fees
 	EntryGracePeriod = 60 * time.Second
 )
 
@@ -38,17 +38,17 @@ type Strategy struct {
 
 // TrackedMarket represents an O/U market being monitored
 type TrackedMarket struct {
-	Market      *gamma.Market
-	TokenPair   *gamma.ClobTokenPair
-	TotalLine   string // e.g., "220.5", "3.5", etc.
-	
-	OverBid     float64
-	OverAsk     float64
-	OverMid     float64
-	UnderBid    float64
-	UnderAsk    float64
-	UnderMid    float64
-	
+	Market    *gamma.Market
+	TokenPair *gamma.ClobTokenPair
+	TotalLine string // e.g., "220.5", "3.5", etc.
+
+	OverBid  float64
+	OverAsk  float64
+	OverMid  float64
+	UnderBid float64
+	UnderAsk float64
+	UnderMid float64
+
 	LastUpdate  time.Time
 	HasPosition bool
 	GameTime    time.Time
@@ -136,7 +136,7 @@ func (s *Strategy) isOverUnderMarket(market *gamma.Market) bool {
 // extractTotalLine extracts the O/U line from the question (e.g., "220.5" from "Lakers vs Warriors: O/U 220.5")
 func (s *Strategy) extractTotalLine(question string) string {
 	questionLower := strings.ToLower(question)
-	
+
 	// Look for pattern after "o/u" or "over/under"
 	markers := []string{"o/u ", "over/under ", "total "}
 	for _, marker := range markers {
@@ -200,15 +200,16 @@ func (s *Strategy) discoverMarkets() {
 						gameTime, _ = time.Parse(time.RFC3339, market.EndDate)
 					}
 
-					// Skip if game is too far in the future (>48 hours)
+					// Skip if game is too far in the future (>48 hours) or already ended (>4 hours after start)
 					if !gameTime.IsZero() {
 						hoursUntilGame := time.Until(gameTime).Hours()
 						if hoursUntilGame > 48 {
 							skippedTooFar++
 							continue
 						}
-						// Also skip if game has already started (time < 0)
-						if hoursUntilGame < 0 {
+						// Skip if game likely ended (4+ hours after start)
+						// Keep live games (0 to -4 hours) to enable in-game trading
+						if hoursUntilGame < -4 {
 							continue
 						}
 					}
@@ -270,7 +271,7 @@ func (s *Strategy) fetchMarketPrices(tokenID string) (float64, float64, float64,
 		lastIdx := len(book.Bids) - 1
 		fmt.Sscanf(book.Bids[lastIdx].Price, "%f", &bestBid)
 	}
-	// API returns asks sorted from WORST to BEST (high to low)  
+	// API returns asks sorted from WORST to BEST (high to low)
 	// So best ask is the LAST element (lowest price someone will sell)
 	if len(book.Asks) > 0 {
 		lastIdx := len(book.Asks) - 1
@@ -349,22 +350,18 @@ func (s *Strategy) analyzeAndTradeDeltaNeutral(tracked *TrackedMarket) {
 	underInRange := tracked.UnderMid >= MinValidPrice && tracked.UnderMid <= MaxUnderPrice
 
 	combinedSpread := tracked.OverMid + tracked.UnderMid
-	
-	// CRITICAL: Combined price must leave room for profit after fees
-	hasEdge := combinedSpread < MaxCombinedPrice
-	edgePercent := (1.0 - combinedSpread) * 100
 
-	if overInRange && underInRange && hasEdge {
+	// Buy both sides - profit comes from selling at different times as game total shifts
+	// e.g., if game goes high-scoring, Over rises while Under falls
+	// Sell Under early (cut losses), let Over run, then sell at peak
+	if overInRange && underInRange {
 		log.Printf("O/U: 💰 DELTA NEUTRAL OPPORTUNITY")
 		log.Printf("  Market: %s", truncateQuestion(tracked.Market.Question))
-		log.Printf("  OVER: %.4f mid (ask: %.4f)", tracked.OverMid, tracked.OverAsk)
-		log.Printf("  UNDER: %.4f mid (ask: %.4f)", tracked.UnderMid, tracked.UnderAsk)
-		log.Printf("  Combined: %.4f (%.2f%% edge, min required: %.0f%%)", combinedSpread, edgePercent, (1.0-MaxCombinedPrice)*100)
+		log.Printf("  OVER: %.4f mid (ask: %.4f) - Sell if game goes low-scoring", tracked.OverMid, tracked.OverAsk)
+		log.Printf("  UNDER: %.4f mid (ask: %.4f) - Sell if game goes high-scoring", tracked.UnderMid, tracked.UnderAsk)
+		log.Printf("  Combined: %.4f - Profit from differential exit timing", combinedSpread)
 
 		s.executeDeltaNeutralEntry(tracked)
-	} else if overInRange && underInRange && !hasEdge {
-		log.Printf("O/U: SKIP %s - combined %.4f exceeds max %.4f (only %.2f%% edge)",
-			truncateQuestion(tracked.Market.Question), combinedSpread, MaxCombinedPrice, edgePercent)
 	}
 }
 

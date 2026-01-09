@@ -14,13 +14,13 @@ import (
 )
 
 // Entry thresholds - buy both sides when prices are in these ranges
+// Profit comes from selling at different times as odds shift during the game
 const (
-	MaxUnderdogPrice   = 0.35 // Buy underdog if < 35% (tightened from 40%)
-	MaxFavoritePrice   = 0.60 // Buy favorite if < 60% (tightened from 65%)
-	MinValidPrice      = 0.05 // Minimum price to consider
-	MaxSpreadPercent   = 0.50 // Allow wider spreads for sports
-	MaxCombinedPrice   = 0.94 // Combined odds must be < 94% for edge after 2% fees
-	EntryGracePeriod   = 60 * time.Second
+	MaxUnderdogPrice = 0.45 // Buy underdog if < 45%
+	MaxFavoritePrice = 0.65 // Buy favorite if < 65%
+	MinValidPrice    = 0.05 // Minimum price to consider
+	MaxSpreadPercent = 0.50 // Max bid-ask spread allowed
+	EntryGracePeriod = 60 * time.Second
 )
 
 // Strategy implements the sports moneyline strategy with delta neutral approach
@@ -38,31 +38,31 @@ type Strategy struct {
 
 // TrackedMarket represents a moneyline market being monitored
 type TrackedMarket struct {
-	Market      *gamma.Market
-	TokenPair   *gamma.ClobTokenPair
+	Market       *gamma.Market
+	TokenPair    *gamma.ClobTokenPair
 	OutcomeNames []string // e.g., ["Lakers", "Warriors"] or ["Yes", "No"]
-	
+
 	// Prices - index 0 is typically underdog, index 1 favorite
-	YesBid      float64
-	YesAsk      float64
-	YesMid      float64
-	NoBid       float64
-	NoAsk       float64
-	NoMid       float64
-	
+	YesBid float64
+	YesAsk float64
+	YesMid float64
+	NoBid  float64
+	NoAsk  float64
+	NoMid  float64
+
 	LastUpdate  time.Time
 	HasPosition bool
 	GameTime    time.Time
-	
+
 	// Track which side is underdog (lower price = underdog)
 	IsYesUnderdog bool
-	
+
 	// Live game tracking
-	GameStatus      string        // "PRE_GAME", "LIVE", "FINAL"
-	PriceHistory    []PricePoint  // Last N price points for momentum detection
-	LastOddsShift   float64       // Recent odds change (positive = improving)
-	PeakUnderdogMid float64       // Highest underdog price seen (for exit detection)
-	PeakFavoriteMid float64       // Highest favorite price seen
+	GameStatus      string       // "PRE_GAME", "LIVE", "FINAL"
+	PriceHistory    []PricePoint // Last N price points for momentum detection
+	LastOddsShift   float64      // Recent odds change (positive = improving)
+	PeakUnderdogMid float64      // Highest underdog price seen (for exit detection)
+	PeakFavoriteMid float64      // Highest favorite price seen
 }
 
 // PricePoint represents a price snapshot for tracking odds movements
@@ -233,15 +233,16 @@ func (s *Strategy) discoverMarkets() {
 				gameTime, _ = time.Parse(time.RFC3339, market.EndDate)
 			}
 
-			// Skip if game is too far in the future (>48 hours)
+			// Skip if game is too far in the future (>48 hours) or already ended (>4 hours after start)
 			if !gameTime.IsZero() {
 				hoursUntilGame := time.Until(gameTime).Hours()
 				if hoursUntilGame > 48 {
 					skippedTooFar++
 					continue
 				}
-				// Also skip if game has already started (time < 0)
-				if hoursUntilGame < 0 {
+				// Skip if game likely ended (4+ hours after start)
+				// Keep live games (0 to -4 hours) to enable in-game trading
+				if hoursUntilGame < -4 {
 					continue
 				}
 			}
@@ -254,9 +255,8 @@ func (s *Strategy) discoverMarkets() {
 			}
 
 			if !s.isMoneylineMarket(&market) {
-						continue
-					}
-
+				continue
+			}
 
 			tokenPair, err := market.GetClobTokenPair()
 			if err != nil {
@@ -346,7 +346,7 @@ func (s *Strategy) updatePricesAndTrade() {
 			delete(s.trackedMarkets, marketID)
 			continue
 		}
-		
+
 		// Determine game status (PRE_GAME or LIVE)
 		if !tracked.GameTime.IsZero() {
 			if now.Before(tracked.GameTime) {
@@ -380,7 +380,7 @@ func (s *Strategy) updatePricesAndTrade() {
 		tracked.NoMid = noMid
 		tracked.IsYesUnderdog = yesMid < noMid
 		tracked.LastUpdate = now
-		
+
 		// Add to price history (keep last N points)
 		maxHistory := s.Config.SportsOddsHistorySize
 		tracked.PriceHistory = append(tracked.PriceHistory, PricePoint{
@@ -391,12 +391,12 @@ func (s *Strategy) updatePricesAndTrade() {
 		if len(tracked.PriceHistory) > maxHistory {
 			tracked.PriceHistory = tracked.PriceHistory[1:] // Remove oldest
 		}
-		
+
 		// Calculate odds shift if we have enough history
 		if len(tracked.PriceHistory) >= 3 {
 			tracked.LastOddsShift = s.calculateOddsShift(tracked)
 		}
-		
+
 		// Track peak prices for exit detection
 		var underdogMid, favoriteMid float64
 		if tracked.IsYesUnderdog {
@@ -404,7 +404,7 @@ func (s *Strategy) updatePricesAndTrade() {
 		} else {
 			underdogMid, favoriteMid = noMid, yesMid
 		}
-		
+
 		if underdogMid > tracked.PeakUnderdogMid {
 			tracked.PeakUnderdogMid = underdogMid
 		}
@@ -468,30 +468,30 @@ func (s *Strategy) analyzeAndTradeDeltaNeutral(tracked *TrackedMarket) {
 		if s.shouldEnterOnOddsImprovement(tracked) {
 			log.Printf("Sports: 🔥 LIVE GAME - Odds Shift Detected!")
 			log.Printf("  Market: %s (%s)", truncateQuestion(tracked.Market.Question), tracked.GameStatus)
-			log.Printf("  %s (underdog): %.4f mid (shift: +%.1f%%), ask: %.4f", 
+			log.Printf("  %s (underdog): %.4f mid (shift: +%.1f%%), ask: %.4f",
 				underdogName, underdogMid, tracked.LastOddsShift*100, underdogAsk)
-			
+
 			if s.Config.SportsDeltaNeutral {
-				s.executeDeltaNeutralEntry(tracked, underdogToken, favoriteToken, underdogAsk, favoriteAsk, 
+				s.executeDeltaNeutralEntry(tracked, underdogToken, favoriteToken, underdogAsk, favoriteAsk,
 					underdogMid, favoriteMid, underdogName, favoriteName)
 			} else {
 				s.executeSingleSideEntry(tracked, underdogToken, underdogAsk, underdogMid, underdogName)
 			}
 			return
 		}
-		
+
 		// LIVE GAME STRATEGY 2: Late game favorite (high probability win)
 		if s.shouldEnterLateGameFavorite(tracked, favoriteMid) {
 			log.Printf("Sports: ⚡ LATE GAME FAVORITE (40+ mins)")
 			log.Printf("  Market: %s", truncateQuestion(tracked.Market.Question))
-			log.Printf("  %s (favorite): %.4f mid (%.0f%% prob), ask: %.4f", 
+			log.Printf("  %s (favorite): %.4f mid (%.0f%% prob), ask: %.4f",
 				favoriteName, favoriteMid, favoriteMid*100, favoriteAsk)
-			
+
 			// Single-side entry on favorite (high conviction)
 			s.executeSingleSideEntry(tracked, favoriteToken, favoriteAsk, favoriteMid, favoriteName)
 			return
 		}
-		
+
 		// If LIVE_GAME_ONLY mode, skip pre-game style entries
 		if s.Config.SportsLiveGameOnly {
 			return
@@ -501,7 +501,7 @@ func (s *Strategy) analyzeAndTradeDeltaNeutral(tracked *TrackedMarket) {
 	// PRE-GAME STRATEGY: Buy FAVORITE (and optionally underdog for delta neutral)
 	// Main strategy: Buy favorite before game, sell during game when odds increase to ~100%
 	// Delta neutral: Also buy underdog to hedge against favorite losing
-	
+
 	// DEBUG: Log actual prices for first few markets each cycle
 	combinedSpread := underdogMid + favoriteMid
 	if underdogMid > 0 && favoriteMid > 0 {
@@ -517,24 +517,20 @@ func (s *Strategy) analyzeAndTradeDeltaNeutral(tracked *TrackedMarket) {
 	// Check mode: delta neutral (buy both) or single-side (buy favorite only)
 	if s.Config.SportsDeltaNeutral {
 		// DELTA NEUTRAL MODE: Buy both sides pre-game
-		// This protects against favorite losing (underdog offsets loss)
+		// Profit comes from selling at DIFFERENT TIMES as odds shift:
+		// - Sell losing side early (e.g., when drops 25%)
+		// - Let winning side run (e.g., sell at 95%+)
+		// - The differential timing creates profit
 		underdogInRange := underdogMid >= MinValidPrice && underdogMid <= MaxUnderdogPrice
 
-		// CRITICAL: Combined price must leave room for profit after fees (2% round-trip)
-		hasEdge := combinedSpread < MaxCombinedPrice
-		edgePercent := (1.0 - combinedSpread) * 100
-
-		if favoriteInRange && underdogInRange && hasEdge {
+		if favoriteInRange && underdogInRange {
 			log.Printf("Sports: 💰 DELTA NEUTRAL PRE-GAME (%s)", tracked.GameStatus)
 			log.Printf("  Market: %s", truncateQuestion(tracked.Market.Question))
-			log.Printf("  %s (favorite): %.4f mid (ask: %.4f) - Will sell when odds → 95-100%%", favoriteName, favoriteMid, favoriteAsk)
-			log.Printf("  %s (underdog): %.4f mid (ask: %.4f) - Hedge position", underdogName, underdogMid, underdogAsk)
-			log.Printf("  Combined: %.4f (%.2f%% edge, min required: %.0f%%)", combinedSpread, edgePercent, (1.0-MaxCombinedPrice)*100)
+			log.Printf("  %s (favorite): %.4f mid (ask: %.4f) - Sell when hits 95%%+", favoriteName, favoriteMid, favoriteAsk)
+			log.Printf("  %s (underdog): %.4f mid (ask: %.4f) - Cut early if losing", underdogName, underdogMid, underdogAsk)
+			log.Printf("  Combined: %.4f - Profit from differential exit timing", combinedSpread)
 
 			s.executeDeltaNeutralEntry(tracked, underdogToken, favoriteToken, underdogAsk, favoriteAsk, underdogMid, favoriteMid, underdogName, favoriteName)
-		} else if favoriteInRange && underdogInRange && !hasEdge {
-			log.Printf("Sports: SKIP %s - combined %.4f exceeds max %.4f (only %.2f%% edge)",
-				truncateQuestion(tracked.Market.Question), combinedSpread, MaxCombinedPrice, edgePercent)
 		}
 	} else {
 		// SINGLE-SIDE MODE: Buy favorite only
@@ -549,7 +545,7 @@ func (s *Strategy) analyzeAndTradeDeltaNeutral(tracked *TrackedMarket) {
 }
 
 func (s *Strategy) executeDeltaNeutralEntry(
-	tracked *TrackedMarket, 
+	tracked *TrackedMarket,
 	underdogToken, favoriteToken string,
 	underdogAsk, favoriteAsk float64,
 	underdogMid, favoriteMid float64,
@@ -707,7 +703,7 @@ func (s *Strategy) checkExitsForDeltaNeutral(tracked *TrackedMarket, now time.Ti
 	if len(marketPositions) == 0 {
 		return
 	}
-	
+
 	// LIVE GAME EXIT STRATEGY 1: Sell favorite when odds → 95-100%
 	// This is the main profit mechanism for pre-game favorite entries
 	// Exit BOTH positions when favorite reaches 95%+
@@ -717,10 +713,10 @@ func (s *Strategy) checkExitsForDeltaNeutral(tracked *TrackedMarket, now time.Ti
 			if now.Sub(pos.EntryTime) < EntryGracePeriod {
 				continue
 			}
-			
+
 			var currentPrice float64
 			var isFavorite bool
-			
+
 			// Determine if this position is the favorite
 			if tracked.IsYesUnderdog {
 				// No is favorite
@@ -739,17 +735,17 @@ func (s *Strategy) checkExitsForDeltaNeutral(tracked *TrackedMarket, now time.Ti
 					currentPrice = tracked.NoMid
 				}
 			}
-			
+
 			pos.CurrentPrice = currentPrice
 			pnlPercent := (currentPrice - pos.EntryPrice) / pos.EntryPrice
-			
+
 			// If this is a favorite position and odds are now 95%+, sell BOTH for profit
 			if isFavorite && currentPrice >= 0.95 {
 				log.Printf("Sports: 💎 FAVORITE AT 95%%+ - Closing full position!")
 				log.Printf("  %s (favorite) @ %.4f (entry: %.4f, +%.1f%%)",
 					pos.OutcomeName, currentPrice, pos.EntryPrice, pnlPercent*100)
 				s.executeExit(pos)
-				
+
 				// Also exit paired position if delta neutral
 				if pos.PairedPositionID != "" {
 					if pairedPos := s.RiskManager.GetPosition(pos.PairedPositionID); pairedPos != nil {
@@ -762,7 +758,7 @@ func (s *Strategy) checkExitsForDeltaNeutral(tracked *TrackedMarket, now time.Ti
 							}
 							pairedPos.CurrentPrice = pairedPrice
 							pairedPnlPercent := (pairedPrice - pairedPos.EntryPrice) / pairedPos.EntryPrice
-							
+
 							log.Printf("  %s (underdog) @ %.4f (entry: %.4f, %.1f%%) - Closing hedge",
 								pairedPos.OutcomeName, pairedPrice, pairedPos.EntryPrice, pairedPnlPercent*100)
 							s.executeExit(pairedPos)
@@ -774,7 +770,7 @@ func (s *Strategy) checkExitsForDeltaNeutral(tracked *TrackedMarket, now time.Ti
 			}
 		}
 	}
-	
+
 	// LIVE GAME EXIT STRATEGY 2: Check for peak detection (odds reversal)
 	if tracked.GameStatus == "LIVE" && s.detectPeakAndExit(tracked) {
 		log.Printf("Sports: 📊 PEAK DETECTED - Odds reversing, exiting all positions")
@@ -785,10 +781,10 @@ func (s *Strategy) checkExitsForDeltaNeutral(tracked *TrackedMarket, now time.Ti
 			} else {
 				currentPrice = tracked.NoMid
 			}
-			
+
 			pos.CurrentPrice = currentPrice
 			pnlPercent := (currentPrice - pos.EntryPrice) / pos.EntryPrice
-			
+
 			log.Printf("  %s @ %.4f (entry: %.4f, %.1f%%)",
 				pos.OutcomeName, currentPrice, pos.EntryPrice, pnlPercent*100)
 			s.executeExit(pos)
@@ -840,7 +836,7 @@ func (s *Strategy) checkExitsForDeltaNeutral(tracked *TrackedMarket, now time.Ti
 						}
 						pairedPos.CurrentPrice = pairedPrice
 						pairedPnlPercent := (pairedPrice - pairedPos.EntryPrice) / pairedPos.EntryPrice
-						
+
 						log.Printf("  %s @ %.4f (entry: %.4f, %.1f%%)",
 							pairedPos.OutcomeName, pairedPrice, pairedPos.EntryPrice, pairedPnlPercent*100)
 						s.executeExit(pairedPos)
@@ -876,7 +872,7 @@ func (s *Strategy) checkExitsForDeltaNeutral(tracked *TrackedMarket, now time.Ti
 				pos.OutcomeName, currentPrice, pos.EntryPrice, pnlPercent*100)
 			log.Printf("  Paired position continues independently")
 			s.executeExit(pos)
-			
+
 			// Note: We do NOT close the paired position here
 			// This allows the winning side to continue running
 		}
