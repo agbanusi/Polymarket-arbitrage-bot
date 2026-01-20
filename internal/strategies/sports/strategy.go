@@ -19,7 +19,7 @@ const (
 	MaxUnderdogPrice = 0.45 // Buy underdog if < 45%
 	MaxFavoritePrice = 0.65 // Buy favorite if < 65%
 	MinValidPrice    = 0.05 // Minimum price to consider
-	MaxSpreadPercent = 0.50 // Max bid-ask spread allowed
+	MaxSpreadPercent = 0.10 // Max bid-ask spread allowed
 	EntryGracePeriod = 60 * time.Second
 )
 
@@ -367,8 +367,8 @@ func (s *Strategy) updatePricesAndTrade() {
 
 		// DEBUG: Log first few markets to see why prices fail
 		if !yesValid || !noValid {
-			log.Printf("Sports: PRICE FAIL %s | YesValid=%v (bid=%.4f ask=%.4f) | NoValid=%v (bid=%.4f ask=%.4f)",
-				truncateQuestion(tracked.Market.Question), yesValid, yesBid, yesAsk, noValid, noBid, noAsk)
+			// log.Printf("Sports: PRICE FAIL %s | YesValid=%v (bid=%.4f ask=%.4f) | NoValid=%v (bid=%.4f ask=%.4f)",
+			// 	truncateQuestion(tracked.Market.Question), yesValid, yesBid, yesAsk, noValid, noBid, noAsk)
 			continue
 		}
 

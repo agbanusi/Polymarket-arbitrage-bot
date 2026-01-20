@@ -118,9 +118,9 @@ func LoadConfig() *Config {
 		SportsExitTarget:     getEnvFloat("SPORTS_EXIT_TARGET", 0.55),
 		SportsDeltaNeutral:   getEnvBool("SPORTS_DELTA_NEUTRAL", true), // Default: buy both sides for protection
 		SportsTags: getEnvSlice("SPORTS_TAGS", []string{
-			"NBA", "NFL", "MLB", "NHL",
+			"NBA", // "NFL", "MLB", "NHL",
 			// "Soccer", "Football",
-			"EPL", "laliga",
+			// "EPL", "laliga",
 			// "La Liga", "Serie A", "Bundesliga", "Ligue 1",
 			// "Champions League", "UEFA", //"MLS",
 		}),

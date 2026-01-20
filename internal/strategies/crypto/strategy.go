@@ -266,7 +266,7 @@ func (s *Strategy) isShortTermMarket(market gamma.Market) bool {
 
 	// STRICT TIME WINDOWS for short-term crypto trading
 	// 15-minute window: 5-20 minutes (allows some buffer for entry/exit)
-	is15Min := timeUntilExpiry >= 5*time.Minute && timeUntilExpiry <= 20*time.Minute
+	is15Min := timeUntilExpiry <= 20*time.Minute
 
 	// 1-hour window: 40-80 minutes
 	is1Hr := timeUntilExpiry >= 40*time.Minute && timeUntilExpiry <= 80*time.Minute

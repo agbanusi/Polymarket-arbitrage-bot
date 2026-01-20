@@ -28,9 +28,9 @@ const (
 
 // Position limits
 const (
-	MaxPositions       = 40 // Total max positions across all strategies
+	MaxPositions       = 30 // Total max positions across all strategies
 	MaxCryptoPositions = 10 // Crypto: only high-conviction 15min/1hr/4hr trades
-	MaxSportsPositions = 30 // Sports/O/U: increased for live game opportunities
+	MaxSportsPositions = 20 // Sports/O/U: increased for live game opportunities
 )
 
 // Position represents an open position

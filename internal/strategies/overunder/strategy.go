@@ -16,10 +16,10 @@ import (
 // Entry thresholds for O/U markets
 // Profit comes from selling at different times as game total shifts
 const (
-	MaxOverPrice     = 0.50 // Buy Over if < 50%
-	MaxUnderPrice    = 0.50 // Buy Under if < 50%
+	MaxOverPrice     = 0.60 // Buy Over if < 60%
+	MaxUnderPrice    = 0.60 // Buy Under if < 40%
 	MinValidPrice    = 0.05
-	MaxSpreadPercent = 0.50
+	MaxSpreadPercent = 1.50
 	EntryGracePeriod = 60 * time.Second
 )
 
