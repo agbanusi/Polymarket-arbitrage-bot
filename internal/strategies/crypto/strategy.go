@@ -392,7 +392,7 @@ func (s *Strategy) analyzeAndTrade(tracked *TrackedCryptoMarket) {
 
 	// SPREAD ARBITRAGE
 	// If Yes + No < 1.0 (minus fees), there's theoretical arbitrage
-	if tracked.Spread < maxSpread && tracked.Spread > 0.20 {
+	if tracked.Spread < maxSpread && tracked.Spread > 0.10 {
 		log.Printf("Crypto: SPREAD ARB - %s (Yes: %.4f + No: %.4f = %.4f)%s",
 			tracked.Symbol, tracked.YesPrice, tracked.NoPrice, tracked.Spread,
 			func() string {

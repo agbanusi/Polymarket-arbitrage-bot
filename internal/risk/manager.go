@@ -28,9 +28,10 @@ const (
 
 // Position limits
 const (
-	MaxPositions       = 30 // Total max positions across all strategies
-	MaxCryptoPositions = 10 // Crypto: only high-conviction 15min/1hr/4hr trades
-	MaxSportsPositions = 20 // Sports/O/U: increased for live game opportunities
+	MaxPositions         = 30 // Total max positions across all strategies
+	MaxCryptoPositions   = 10 // Crypto: only high-conviction 15min/1hr/4hr trades
+	MaxSportsPositions   = 20 // Sports/O/U: increased for live game opportunities
+	MaxCrossArbPositions = 10 // Cross-platform arb positions
 )
 
 // Position represents an open position
@@ -173,6 +174,8 @@ func (m *Manager) CanAddPositionForStrategy(strategy string) bool {
 		return count < MaxCryptoPositions
 	case "sports", "overunder":
 		return count < MaxSportsPositions
+	case "crossarb":
+		return count < MaxCrossArbPositions
 	default:
 		return true
 	}

@@ -77,4 +77,4 @@ echo ""
 echo -e "${GREEN}Starting bot...${NC}"
 echo ""
 
-go run cmd/bot/main.go
+go run main.go

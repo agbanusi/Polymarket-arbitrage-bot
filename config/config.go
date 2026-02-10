@@ -58,6 +58,16 @@ type Config struct {
 	SportsOddsHistorySize int     // Number of price points to track for momentum
 	SportsLateGameMinOdds float64 // Min odds for late-game favorite entry (e.g., 0.85)
 
+	// Kalshi API (for cross-platform arbitrage)
+	KalshiAPIKey     string
+	KalshiPrivateKey string
+	KalshiBaseURL    string
+
+	// Cross-Platform Arbitrage Strategy
+	CrossArbEnabled      bool    // Enable Kalshi-Polymarket arbitrage
+	CrossArbMinProfit    float64 // Minimum profit per contract (default: 0.01)
+	CrossArbMaxPositions int     // Max simultaneous cross-arb positions
+
 	// Monitoring
 	PriceUpdateInterval int // Seconds between price updates
 	LogLevel            string
@@ -115,12 +125,12 @@ func LoadConfig() *Config {
 		SportsEnabled:        getEnvBool("SPORTS_ENABLED", true),
 		SportsOUEnabled:      getEnvBool("SPORTS_OU_ENABLED", true),
 		SportsEntryThreshold: getEnvFloat("SPORTS_ENTRY_THRESHOLD", 0.25),
-		SportsExitTarget:     getEnvFloat("SPORTS_EXIT_TARGET", 0.55),
+		SportsExitTarget:     getEnvFloat("SPORTS_EXIT_TARGET", 0.65),
 		SportsDeltaNeutral:   getEnvBool("SPORTS_DELTA_NEUTRAL", true), // Default: buy both sides for protection
 		SportsTags: getEnvSlice("SPORTS_TAGS", []string{
-			"NBA", // "NFL", "MLB", "NHL",
+			"NBA", "NFL", "MLB", "NHL",
 			// "Soccer", "Football",
-			// "EPL", "laliga",
+			"EPL", "laliga",
 			// "La Liga", "Serie A", "Bundesliga", "Ligue 1",
 			// "Champions League", "UEFA", //"MLS",
 		}),
@@ -138,6 +148,16 @@ func LoadConfig() *Config {
 		SportsOddsShiftMin:    getEnvFloat("SPORTS_ODDS_SHIFT_MIN", 0.10),
 		SportsOddsHistorySize: getEnvInt("SPORTS_ODDS_HISTORY_SIZE", 10),
 		SportsLateGameMinOdds: getEnvFloat("SPORTS_LATE_GAME_MIN_ODDS", 0.85),
+
+		// Kalshi API
+		KalshiAPIKey:     getEnv("KALSHI_API_KEY", ""),
+		KalshiPrivateKey: getEnv("KALSHI_PRIVATE_KEY", ""),
+		KalshiBaseURL:    getEnv("KALSHI_BASE_URL", ""),
+
+		// Cross-Platform Arbitrage
+		CrossArbEnabled:      getEnvBool("CROSS_ARB_ENABLED", true),
+		CrossArbMinProfit:    getEnvFloat("CROSS_ARB_MIN_PROFIT", 0.01),
+		CrossArbMaxPositions: getEnvInt("CROSS_ARB_MAX_POSITIONS", 10),
 
 		// Monitoring
 		PriceUpdateInterval: getEnvInt("PRICE_UPDATE_INTERVAL", 5),

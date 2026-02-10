@@ -11,9 +11,11 @@ import (
 	"polymarket-bot/config"
 	"polymarket-bot/internal/clients/clob"
 	"polymarket-bot/internal/clients/gamma"
+	"polymarket-bot/internal/clients/kalshi"
 	"polymarket-bot/internal/clients/rtds"
 	"polymarket-bot/internal/risk"
 	"polymarket-bot/internal/services"
+	"polymarket-bot/internal/strategies/crossarb"
 	"polymarket-bot/internal/strategies/crypto"
 	"polymarket-bot/internal/strategies/overunder"
 	"polymarket-bot/internal/strategies/sports"
@@ -42,6 +44,7 @@ func main() {
 	gammaClient := gamma.NewClient(cfg)
 	clobClient := clob.NewClient(cfg)
 	rtdsClient := rtds.NewClient()
+	kalshiClient := kalshi.NewClient(cfg)
 
 	// 3. Connect WebSocket (RTDS) for real-time prices
 	go func() {
@@ -78,6 +81,7 @@ func main() {
 	sportsStrategy := sports.NewStrategy(cfg, gammaClient, clobClient, riskManager)
 	ouStrategy := overunder.NewStrategy(cfg, gammaClient, clobClient, riskManager)
 	cryptoStrategy := crypto.NewStrategy(cfg, gammaClient, clobClient, riskManager)
+	crossArbStrategy := crossarb.NewStrategy(cfg, gammaClient, clobClient, kalshiClient, riskManager)
 
 	// 7. Create context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
@@ -110,11 +114,18 @@ func main() {
 		log.Println("⚪ Crypto strategy disabled")
 	}
 
+	if cfg.CrossArbEnabled {
+		go crossArbStrategy.Run()
+		log.Println("✅ Cross-platform arbitrage strategy started")
+	} else {
+		log.Println("⚪ Cross-platform arbitrage disabled")
+	}
+
 	// 9. Start RTDS message processor (for real-time price updates)
 	go processRTDSUpdates(ctx, rtdsClient, riskManager)
 
 	// 10. Status logging
-	go logPeriodicStatus(ctx, sportsStrategy, ouStrategy, cryptoStrategy, riskManager)
+	go logPeriodicStatus(ctx, sportsStrategy, ouStrategy, cryptoStrategy, crossArbStrategy, riskManager)
 
 	log.Println("==============================================")
 	log.Println("Bot is now running. Press Ctrl+C to stop.")
@@ -134,6 +145,7 @@ func main() {
 	sportsStrategy.Stop()
 	ouStrategy.Stop()
 	cryptoStrategy.Stop()
+	crossArbStrategy.Stop()
 	positionMonitor.Stop()
 	settlementService.Stop()
 
@@ -169,13 +181,14 @@ func processRTDSUpdates(ctx context.Context, client *rtds.Client, rm *risk.Manag
 }
 
 // logPeriodicStatus logs strategy status and detailed position reports every 2 minutes (testing)
-func logPeriodicStatus(ctx context.Context, sportsStrat *sports.Strategy, ouStrat *overunder.Strategy, cryptoStrat *crypto.Strategy, rm *risk.Manager) {
+func logPeriodicStatus(ctx context.Context, sportsStrat *sports.Strategy, ouStrat *overunder.Strategy, cryptoStrat *crypto.Strategy, crossArbStrat *crossarb.Strategy, rm *risk.Manager) {
 	// Print immediate report after 30 seconds
 	time.Sleep(30 * time.Second)
 	log.Println("=== INITIAL STATUS REPORT ===")
 	log.Println(sportsStrat.GetStatus())
 	log.Println(ouStrat.GetStatus())
 	log.Println(cryptoStrat.GetStatus())
+	log.Println(crossArbStrat.GetStatus())
 	log.Print(rm.GetDetailedReport())
 	log.Println("=============================")
 
@@ -191,6 +204,7 @@ func logPeriodicStatus(ctx context.Context, sportsStrat *sports.Strategy, ouStra
 			log.Println(sportsStrat.GetStatus())
 			log.Println(ouStrat.GetStatus())
 			log.Println(cryptoStrat.GetStatus())
+			log.Println(crossArbStrat.GetStatus())
 			log.Print(rm.GetDetailedReport())
 			log.Println("==============================")
 		}
