@@ -80,7 +80,7 @@ func (s *Strategy) Run() {
 	discoveryTicker := time.NewTicker(60 * time.Second)
 	defer discoveryTicker.Stop()
 
-	priceTicker := time.NewTicker(time.Duration(s.Config.PriceUpdateInterval) * time.Second)
+	priceTicker := time.NewTicker(1 * time.Second)
 	defer priceTicker.Stop()
 
 	s.discoverMarkets()
@@ -327,9 +327,11 @@ func (s *Strategy) updatePricesAndTrade() {
 		tracked.UnderMid = underMid
 		tracked.LastUpdate = now
 
-		s.RiskManager.UpdatePrice(tracked.TokenPair.Yes, overMid)
-		s.RiskManager.UpdatePrice(tracked.TokenPair.No, underMid)
+		// Update risk manager with prices for existing positions (using BID for exit valuation)
+		s.RiskManager.UpdatePrice(tracked.TokenPair.Yes, overBid)
+		s.RiskManager.UpdatePrice(tracked.TokenPair.No, underBid)
 
+		// Check for exits (TP, SL, or SCRAPE)
 		s.checkExitsForDeltaNeutral(tracked, now)
 
 		if s.RiskManager.HasPositionForMarket(marketID) {
@@ -461,73 +463,70 @@ func (s *Strategy) checkExitsForDeltaNeutral(tracked *TrackedMarket, now time.Ti
 		return
 	}
 
-	for _, pos := range marketPositions {
-		if now.Sub(pos.EntryTime) < EntryGracePeriod {
-			continue
+	// 1. SCRAPE CENTS LOGIC (Guaranteed Profit)
+	// If we hold both sides (hedged), check if we can exit for combined profit
+	if len(marketPositions) >= 2 {
+		totalCost, totalValue := 0.0, 0.0
+		for _, pos := range marketPositions {
+			totalCost += pos.EntryPrice * pos.Size
+			// Value based on BID (what we can sell at)
+			if pos.TokenID == tracked.TokenPair.Yes {
+				totalValue += tracked.OverBid * pos.Size
+			} else {
+				totalValue += tracked.UnderBid * pos.Size
+			}
 		}
 
-		var currentPrice float64
-		if pos.TokenID == tracked.TokenPair.Yes {
-			currentPrice = tracked.OverMid
-		} else {
-			currentPrice = tracked.UnderMid
-		}
-
-		if currentPrice < MinValidPrice {
-			continue
-		}
-
-		pos.CurrentPrice = currentPrice
-		pnlPercent := (currentPrice - pos.EntryPrice) / pos.EntryPrice
-
-		if pnlPercent >= s.Config.TakeProfitPercent {
-			log.Printf("O/U: 🎯 TAKE PROFIT - %s @ %.4f (entry: %.4f, +%.1f%%)",
-				pos.OutcomeName, currentPrice, pos.EntryPrice, pnlPercent*100)
-
-			s.executeExit(pos)
-
-			if pos.PairedPositionID != "" {
-				if pairedPos := s.RiskManager.GetPosition(pos.PairedPositionID); pairedPos != nil {
-					if pairedPos.State == risk.StateOpen {
-						s.executeExit(pairedPos)
-					}
-				}
+		profitPercent := (totalValue - totalCost) / totalCost
+		// If guaranteed profit exceeds 2%, take it and "scrape"
+		if profitPercent >= 0.02 {
+			log.Printf("O/U: 🤏 SCRAPE CENTS - Combined profit @ %.1f%%, closing all", profitPercent*100)
+			for _, pos := range marketPositions {
+				s.executeExit(pos)
 			}
 			tracked.HasPosition = false
 			return
 		}
 	}
 
-	// Stop loss check
+	// 2. INDEPENDENT MONITORING (Target 95%+, SL, TP)
 	for _, pos := range marketPositions {
 		if now.Sub(pos.EntryTime) < EntryGracePeriod {
 			continue
 		}
 
-		var currentPrice float64
+		var currentExitPrice float64
 		if pos.TokenID == tracked.TokenPair.Yes {
-			currentPrice = tracked.OverMid
+			currentExitPrice = tracked.OverBid
 		} else {
-			currentPrice = tracked.UnderMid
+			currentExitPrice = tracked.UnderBid
 		}
 
-		pos.CurrentPrice = currentPrice
-		pnlPercent := (currentPrice - pos.EntryPrice) / pos.EntryPrice
+		pos.CurrentPrice = currentExitPrice
+		pnlPercent := (currentExitPrice - pos.EntryPrice) / pos.EntryPrice
 
-		if pnlPercent <= -s.Config.StopLossPercent {
-			log.Printf("O/U: 🛑 STOP LOSS - %s @ %.4f (entry: %.4f, %.1f%%)",
-				pos.OutcomeName, currentPrice, pos.EntryPrice, pnlPercent*100)
+		// TAKE PROFIT (Target 95%+)
+		if currentExitPrice >= 0.95 || pnlPercent >= s.Config.TakeProfitPercent {
+			log.Printf("O/U: 🎯 EXIT TARGET - %s @ %.4f (entry: %.4f, +%.1f%%)",
+				pos.OutcomeName, currentExitPrice, pos.EntryPrice, pnlPercent*100)
 			s.executeExit(pos)
 
-			if pos.PairedPositionID != "" {
-				if pairedPos := s.RiskManager.GetPosition(pos.PairedPositionID); pairedPos != nil {
-					if pairedPos.State == risk.StateOpen {
-						s.executeExit(pairedPos)
-					}
+			// Close paired side too to capture the gain
+			for _, other := range marketPositions {
+				if other.ID != pos.ID && other.State == risk.StateOpen {
+					s.executeExit(other)
 				}
 			}
 			tracked.HasPosition = false
 			return
+		}
+
+		// STOP LOSS (Independent)
+		if pnlPercent <= -s.Config.StopLossPercent {
+			log.Printf("O/U: 🛑 STOP LOSS - %s @ %.4f (entry: %.4f, %.1f%%)",
+				pos.OutcomeName, currentExitPrice, pos.EntryPrice, pnlPercent*100)
+			s.executeExit(pos)
+			// Paired position continues independently
 		}
 	}
 }

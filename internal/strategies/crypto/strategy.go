@@ -87,8 +87,8 @@ func (s *Strategy) Run() {
 	discoveryTicker := time.NewTicker(30 * time.Second)
 	defer discoveryTicker.Stop()
 
-	// Price monitoring ticker - fast for 15m markets
-	priceTicker := time.NewTicker(3 * time.Second)
+	// Price monitoring ticker - FAST for 15m markets (1 second for production-ready speed)
+	priceTicker := time.NewTicker(1 * time.Second)
 	defer priceTicker.Stop()
 
 	// Cleanup ticker for expired markets
@@ -329,21 +329,26 @@ func (s *Strategy) updatePricesAndTrade() {
 		}
 
 		// Fetch real prices from CLOB
-		yesPrice, yesErr := s.ClobClient.GetBestBid(tracked.TokenPair.Yes)
-		noPrice, noErr := s.ClobClient.GetBestBid(tracked.TokenPair.No)
+		// For buying (entry), we need the ASK price (what sellers want)
+		// For selling (exit), we need the BID price (what buyers want)
+		yesAsk, yesAskErr := s.ClobClient.GetBestAsk(tracked.TokenPair.Yes)
+		noAsk, noAskErr := s.ClobClient.GetBestAsk(tracked.TokenPair.No)
 
-		if yesErr != nil || noErr != nil {
+		yesBid, yesBidErr := s.ClobClient.GetBestBid(tracked.TokenPair.Yes)
+		noBid, noBidErr := s.ClobClient.GetBestBid(tracked.TokenPair.No)
+
+		if yesAskErr != nil || noAskErr != nil || yesBidErr != nil || noBidErr != nil {
 			continue
 		}
 
-		tracked.YesPrice = yesPrice
-		tracked.NoPrice = noPrice
-		tracked.Spread = yesPrice + noPrice
+		tracked.YesPrice = yesAsk // Entry price is Ask
+		tracked.NoPrice = noAsk   // Entry price is Ask
+		tracked.Spread = yesAsk + noAsk
 		tracked.LastUpdate = now
 
-		// Update risk manager with prices for existing positions
-		s.RiskManager.UpdatePrice(tracked.TokenPair.Yes, yesPrice)
-		s.RiskManager.UpdatePrice(tracked.TokenPair.No, noPrice)
+		// Update risk manager with BID prices for existing positions (current exit value)
+		s.RiskManager.UpdatePrice(tracked.TokenPair.Yes, yesBid)
+		s.RiskManager.UpdatePrice(tracked.TokenPair.No, noBid)
 
 		// Check for exits on existing positions (stop loss, take profit, or near-expiry)
 		if s.RiskManager.HasPositionForMarket(marketID) {
@@ -391,9 +396,9 @@ func (s *Strategy) analyzeAndTrade(tracked *TrackedCryptoMarket) {
 	// }
 
 	// SPREAD ARBITRAGE
-	// If Yes + No < 1.0 (minus fees), there's theoretical arbitrage
+	// If AskYes + AskNo < 1.0 (minus fees), there's guaranteed profit if filled
 	if tracked.Spread < maxSpread && tracked.Spread > 0.10 {
-		log.Printf("Crypto: SPREAD ARB - %s (Yes: %.4f + No: %.4f = %.4f)%s",
+		log.Printf("Crypto: 💰 SPREAD ARB FOUND - %s (AskYes: %.4f + AskNo: %.4f = %.4f)%s",
 			tracked.Symbol, tracked.YesPrice, tracked.NoPrice, tracked.Spread,
 			func() string {
 				if isPriority {
@@ -408,29 +413,31 @@ func (s *Strategy) analyzeAndTrade(tracked *TrackedCryptoMarket) {
 		return
 	}
 
-	// LEG-IN STRATEGY
-	// Wait for one side to dip below threshold, then try to leg in
+	// LEG-IN STRATEGY (The Gabagool)
+	// Buying at different times to maximize arb profit
+	// 1. Buy one side when < 96-98 cents (including fees)
+	// 2. Wait for the other side to dip or be profitable combined
 
-	// Check YES side
+	// Threshold for leg-in (very cheap side)
+	// If one side is < 0.45 and the other is < 0.52 etc (Sum < 0.97)
+
+	// Check YES side for first leg
 	if tracked.YesPrice < cheapThreshold && tracked.YesPrice > 0.10 {
-		// Calculate if second leg would be profitable
-		maxSecondLegPrice := 1.0 - tracked.YesPrice - 0.02 // 2% buffer for fees
-		if tracked.NoPrice <= maxSecondLegPrice {
-			log.Printf("Crypto: LEG-IN OPP - %s YES @ %.4f (max NO: %.4f, current NO: %.4f)",
-				tracked.Symbol, tracked.YesPrice, maxSecondLegPrice, tracked.NoPrice)
-
+		// Calculate if second leg would be profitable right NOW
+		// Need AskYes + AskNo < 0.98 for guaranteed arb
+		if tracked.Spread < 0.98 {
+			log.Printf("Crypto: 🍖 GABAGOOL YES - %s YES @ %.4f (Spread: %.4f)",
+				tracked.Symbol, tracked.YesPrice, tracked.Spread)
 			s.executeFirstLeg(tracked, "YES", tracked.TokenPair.Yes, tracked.YesPrice)
 		}
 		return
 	}
 
-	// Check NO side
+	// Check NO side for first leg
 	if tracked.NoPrice < cheapThreshold && tracked.NoPrice > 0.10 {
-		maxSecondLegPrice := 1.0 - tracked.NoPrice - 0.02
-		if tracked.YesPrice <= maxSecondLegPrice {
-			log.Printf("Crypto: LEG-IN OPP - %s NO @ %.4f (max YES: %.4f, current YES: %.4f)",
-				tracked.Symbol, tracked.NoPrice, maxSecondLegPrice, tracked.YesPrice)
-
+		if tracked.Spread < 0.98 {
+			log.Printf("Crypto: 🍖 GABAGOOL NO - %s NO @ %.4f (Spread: %.4f)",
+				tracked.Symbol, tracked.NoPrice, tracked.Spread)
 			s.executeFirstLeg(tracked, "NO", tracked.TokenPair.No, tracked.NoPrice)
 		}
 	}
@@ -736,7 +743,7 @@ func (s *Strategy) checkSecondLeg(tracked *TrackedCryptoMarket) {
 }
 
 // Minimum time before expiry to force exit (30 seconds before market closes)
-const cryptoExpiryBuffer = 10 * time.Second
+const cryptoExpiryBuffer = 30 * time.Second
 
 // Grace period after entry before stop loss / take profit can trigger
 const cryptoEntryGracePeriod = 30 * time.Second
@@ -847,18 +854,30 @@ func (s *Strategy) checkExitsForCrypto(tracked *TrackedCryptoMarket, now time.Ti
 			if pos.PairedPositionID != "" {
 				log.Printf("  Paired position continues independently")
 			}
+		}
 
-			// Check if all positions in this market are now closed
-			remainingOpen := false
-			for _, p := range marketPositions {
-				if p.ID != pos.ID && p.State == risk.StateOpen {
-					remainingOpen = true
-					break
-				}
+		// SCALPING LOGIC (requested)
+		// If we are in the first leg of a leg-in and it's very profitable, SCALP it
+		if tracked.LegInfo != nil && !tracked.LegInfo.SecondLegPlaced && pos.ID != "" {
+			// If pnl is > 20% on the first leg, just scalp it and move on
+			if pnlPercent >= 0.20 {
+				log.Printf("Crypto: ✂️ SCALPING leg-in %s @ %.4f (+%.1f%%)",
+					pos.OutcomeName, currentPrice, pnlPercent*100)
+				s.executeExit(pos)
+				tracked.LegInfo = nil // Reset leg info
 			}
-			if !remainingOpen {
-				tracked.HasPosition = false
+		}
+
+		// Check if all positions in this market are now closed
+		remainingOpen := false
+		for _, p := range marketPositions {
+			if p.ID != pos.ID && p.State == risk.StateOpen {
+				remainingOpen = true
+				break
 			}
+		}
+		if !remainingOpen {
+			tracked.HasPosition = false
 		}
 	}
 }

@@ -149,7 +149,7 @@ func (s *Strategy) Run() {
 	defer discoveryTicker.Stop()
 
 	// Price update ticker - check for opportunities
-	priceTicker := time.NewTicker(3 * time.Second)
+	priceTicker := time.NewTicker(1 * time.Second)
 	defer priceTicker.Stop()
 
 	// Initial discovery
@@ -249,7 +249,19 @@ func (s *Strategy) updatePricesAndTrade() {
 		tracked.KalshiNoAsk = kalshiPrices.NoAsk
 		tracked.LastUpdate = now
 
-		// Check all 4 arbitrage types
+		// Update risk manager with prices for existing positions (using BID for exit valuation)
+		// Polymarket sides
+		s.RiskManager.UpdatePrice(polyTokenPair.Yes, tracked.PolyYesBid)
+		s.RiskManager.UpdatePrice(polyTokenPair.No, tracked.PolyNoBid)
+
+		// Kalshi sides (ticker-based)
+		s.RiskManager.UpdatePrice(tracked.Pair.KalshiMarket.Ticker+"_YES", tracked.KalshiYesBid)
+		s.RiskManager.UpdatePrice(tracked.Pair.KalshiMarket.Ticker+"_NO", tracked.KalshiNoBid)
+
+		// Check for exits (TP, SL, or SCRAPE)
+		s.checkExitsForCrossArb(tracked, now)
+
+		// Check for new arbitrage opportunities
 		s.checkAndExecuteArbs(pairID, tracked)
 	}
 }
@@ -497,8 +509,8 @@ func (s *Strategy) executeArb(pairID string, arb *ArbOpportunity) {
 		log.Printf("CrossArb: [DRY RUN] Would execute %s arb with %d contracts", arb.Type, contracts)
 		s.markPositionOpened(pairID, arb.Type)
 
-		// Track in risk manager for dry run
-		s.trackDryRunPosition(arb, contracts, totalCost)
+		// Track in risk manager for dry run using the unified function
+		s.trackArbPositions(pairID, arb, contracts, totalCost)
 		return
 	}
 
@@ -513,12 +525,68 @@ func (s *Strategy) executeArb(pairID string, arb *ArbOpportunity) {
 	leg2Err := s.executeLeg(arb.Leg2Platform, arb.Leg2Side, arb.Leg2Price, arb.Leg2TokenID, arb.Leg2Ticker, contracts)
 	if leg2Err != nil {
 		log.Printf("CrossArb: Leg2 failed: %v - WARNING: Leg1 already executed!", leg2Err)
-		// TODO: Implement rollback or hedge logic
 		return
 	}
 
+	// Track positions in risk manager for exit management
+	s.trackArbPositions(pairID, arb, contracts, totalCost)
+
 	s.markPositionOpened(pairID, arb.Type)
 	log.Printf("CrossArb: ✅ %s arb executed successfully!", arb.Type)
+}
+
+func (s *Strategy) trackArbPositions(pairID string, arb *ArbOpportunity, contracts int, totalCost float64) {
+	// Leg 1 Position
+	leg1ID := arb.Leg1TokenID
+	if arb.Leg1Platform == "kalshi" {
+		leg1ID = arb.Leg1Ticker + "_" + "YES"
+		if arb.Leg1Side == "no" {
+			leg1ID = arb.Leg1Ticker + "_" + "NO"
+		}
+	}
+
+	pos1 := &risk.Position{
+		MarketID:     pairID,
+		TokenID:      leg1ID,
+		OutcomeName:  fmt.Sprintf("%s_%s", arb.Leg1Platform, arb.Leg1Side),
+		Size:         float64(contracts),
+		EntryPrice:   arb.Leg1Price,
+		CurrentPrice: arb.Leg1Price,
+		Side:         "BUY",
+		Type:         risk.TypeArbitrage,
+		Strategy:     "crossarb",
+		TotalCost:    totalCost / 2,
+	}
+	p1ID := s.RiskManager.AddPosition(pos1)
+
+	// Leg 2 Position
+	leg2ID := arb.Leg2TokenID
+	if arb.Leg2Platform == "kalshi" {
+		leg2ID = arb.Leg2Ticker + "_" + "YES"
+		if arb.Leg2Side == "no" {
+			leg2ID = arb.Leg2Ticker + "_" + "NO"
+		}
+	}
+
+	pos2 := &risk.Position{
+		MarketID:         pairID,
+		TokenID:          leg2ID,
+		OutcomeName:      fmt.Sprintf("%s_%s", arb.Leg2Platform, arb.Leg2Side),
+		Size:             float64(contracts),
+		EntryPrice:       arb.Leg2Price,
+		CurrentPrice:     arb.Leg2Price,
+		Side:             "BUY",
+		Type:             risk.TypeArbitrage,
+		Strategy:         "crossarb",
+		TotalCost:        totalCost / 2,
+		PairedPositionID: p1ID,
+	}
+	p2ID := s.RiskManager.AddPosition(pos2)
+
+	// Link pos1 to pos2
+	if p1 := s.RiskManager.GetPosition(p1ID); p1 != nil {
+		p1.PairedPositionID = p2ID
+	}
 }
 
 // executeLeg executes a single leg of the arbitrage
@@ -568,41 +636,121 @@ func (s *Strategy) markPositionOpened(pairID string, arbType ArbType) {
 }
 
 // trackDryRunPosition tracks a position in dry run mode
-func (s *Strategy) trackDryRunPosition(arb *ArbOpportunity, contracts int, totalCost float64) {
-	// Track as paired positions
-	pos1 := &risk.Position{
-		MarketID:     arb.Pair.Pair.PolyMarket.ID,
-		TokenID:      arb.Leg1TokenID,
-		OutcomeName:  fmt.Sprintf("%s_%s", arb.Leg1Platform, arb.Leg1Side),
-		Size:         float64(contracts),
-		EntryPrice:   arb.Leg1Price,
-		CurrentPrice: arb.Leg1Price,
-		Side:         "BUY",
-		Type:         risk.TypeArbitrage,
-		Strategy:     "crossarb",
-		TotalCost:    totalCost / 2,
-	}
-	pos1ID := s.RiskManager.AddPosition(pos1)
+func (s *Strategy) checkExitsForCrossArb(tracked *TrackedPair, now time.Time) {
+	pairID := s.getPairID(tracked.Pair)
+	positions := s.RiskManager.GetPositionsByStrategy("crossarb")
 
-	pos2 := &risk.Position{
-		MarketID:         arb.Pair.Pair.PolyMarket.ID,
-		TokenID:          arb.Leg2TokenID,
-		OutcomeName:      fmt.Sprintf("%s_%s", arb.Leg2Platform, arb.Leg2Side),
-		Size:             float64(contracts),
-		EntryPrice:       arb.Leg2Price,
-		CurrentPrice:     arb.Leg2Price,
-		Side:             "BUY",
-		Type:             risk.TypeArbitrage,
-		Strategy:         "crossarb",
-		TotalCost:        totalCost / 2,
-		PairedPositionID: pos1ID,
+	var marketPositions []*risk.Position
+	for _, pos := range positions {
+		if pos.MarketID == pairID && pos.State == risk.StateOpen {
+			marketPositions = append(marketPositions, pos)
+		}
 	}
-	pos2ID := s.RiskManager.AddPosition(pos2)
 
-	// Link positions
-	if p1 := s.RiskManager.GetPosition(pos1ID); p1 != nil {
-		p1.PairedPositionID = pos2ID
+	if len(marketPositions) < 2 {
+		return
 	}
+
+	// 1. SCRAPE CENTS LOGIC (Guaranteed Profit)
+	totalCost, totalValue := 0.0, 0.0
+	for _, pos := range marketPositions {
+		totalCost += pos.EntryPrice * pos.Size
+		totalValue += pos.CurrentPrice * pos.Size
+	}
+
+	profitPercent := (totalValue - totalCost) / totalCost
+	if profitPercent >= 0.02 {
+		log.Printf("CrossArb: 🤏 SCRAPE CENTS - Combined cross-platform profit @ %.1f%%, closing all", profitPercent*100)
+		for _, pos := range marketPositions {
+			s.executeExit(pos)
+		}
+		s.resetTrackingFlags(tracked)
+		return
+	}
+
+	// 2. INDEPENDENT MONITORING (Target 95%+)
+	for _, pos := range marketPositions {
+		if now.Sub(pos.EntryTime) < EntryGracePeriod {
+			continue
+		}
+
+		pnlPercent := (pos.CurrentPrice - pos.EntryPrice) / pos.EntryPrice
+
+		// If one leg is extremely profitable
+		if pos.CurrentPrice >= 0.95 || pnlPercent >= s.Config.TakeProfitPercent {
+			log.Printf("CrossArb: 🎯 TARGET REACHED - %s @ %.4f", pos.OutcomeName, pos.CurrentPrice)
+			s.executeExit(pos)
+
+			// Close the other leg too
+			for _, other := range marketPositions {
+				if other.ID != pos.ID && other.State == risk.StateOpen {
+					s.executeExit(other)
+				}
+			}
+			s.resetTrackingFlags(tracked)
+			return
+		}
+	}
+}
+
+func (s *Strategy) resetTrackingFlags(tracked *TrackedPair) {
+	tracked.HasPolyYesKalshiNo = false
+	tracked.HasKalshiYesPolyNo = false
+	tracked.HasPolySameMarket = false
+	tracked.HasKalshiSameMarket = false
+}
+
+func (s *Strategy) executeExit(pos *risk.Position) {
+	platform := "poly"
+	if len(pos.OutcomeName) >= 6 && pos.OutcomeName[:6] == "kalshi" {
+		platform = "kalshi"
+	}
+
+	if s.Config.IsDryRun() {
+		log.Printf("CrossArb: [DRY RUN] Would SELL %s @ %.4f", pos.OutcomeName, pos.CurrentPrice)
+	} else {
+		if platform == "poly" {
+			_, err := s.ClobClient.CreateOrder(clob.CreateOrderRequest{
+				TokenID:   pos.TokenID,
+				Price:     pos.CurrentPrice,
+				Size:      pos.Size,
+				Side:      clob.Sell,
+				OrderType: clob.Limit,
+			})
+			if err != nil {
+				log.Printf("CrossArb: Poly exit failed: %v", err)
+				return
+			}
+		} else {
+			// Kalshi Exit (Sell)
+			side := "yes"
+			if len(pos.OutcomeName) >= 10 && pos.OutcomeName[7:] == "no" {
+				side = "no"
+			}
+
+			// Extract ticker from TokenID (Ticker_YES)
+			ticker := pos.TokenID
+			if len(ticker) > 4 {
+				ticker = ticker[:len(ticker)-4]
+			}
+
+			priceInCents := int(pos.CurrentPrice * 100)
+			_, err := s.KalshiClient.CreateOrder(kalshi.CreateOrderRequest{
+				Ticker:   ticker,
+				Side:     side,
+				Action:   "sell",
+				Type:     "limit",
+				Count:    int(pos.Size),
+				YesPrice: priceInCents,
+			})
+			if err != nil {
+				log.Printf("CrossArb: Kalshi exit failed: %v", err)
+				return
+			}
+		}
+	}
+
+	s.RiskManager.ClosePosition(pos.ID)
 }
 
 // getPairID generates a unique ID for a market pair

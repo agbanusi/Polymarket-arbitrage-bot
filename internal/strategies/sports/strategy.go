@@ -347,12 +347,11 @@ func (s *Strategy) updatePricesAndTrade() {
 			continue
 		}
 
-		// Determine game status (PRE_GAME or LIVE)
+		// Determine game status
 		if !tracked.GameTime.IsZero() {
 			if now.Before(tracked.GameTime) {
 				tracked.GameStatus = "PRE_GAME"
 			} else if now.After(tracked.GameTime) && now.Before(tracked.GameTime.Add(4*time.Hour)) {
-				// Most games are 2-3 hours, 4 hours is safe buffer
 				tracked.GameStatus = "LIVE"
 			} else {
 				tracked.GameStatus = "FINAL"
@@ -365,10 +364,7 @@ func (s *Strategy) updatePricesAndTrade() {
 		yesBid, yesAsk, yesMid, yesValid := s.fetchMarketPrices(tracked.TokenPair.Yes)
 		noBid, noAsk, noMid, noValid := s.fetchMarketPrices(tracked.TokenPair.No)
 
-		// DEBUG: Log first few markets to see why prices fail
 		if !yesValid || !noValid {
-			// log.Printf("Sports: PRICE FAIL %s | YesValid=%v (bid=%.4f ask=%.4f) | NoValid=%v (bid=%.4f ask=%.4f)",
-			// 	truncateQuestion(tracked.Market.Question), yesValid, yesBid, yesAsk, noValid, noBid, noAsk)
 			continue
 		}
 
@@ -381,7 +377,7 @@ func (s *Strategy) updatePricesAndTrade() {
 		tracked.IsYesUnderdog = yesMid < noMid
 		tracked.LastUpdate = now
 
-		// Add to price history (keep last N points)
+		// Add to price history
 		maxHistory := s.Config.SportsOddsHistorySize
 		tracked.PriceHistory = append(tracked.PriceHistory, PricePoint{
 			Timestamp: now,
@@ -389,15 +385,15 @@ func (s *Strategy) updatePricesAndTrade() {
 			NoMid:     noMid,
 		})
 		if len(tracked.PriceHistory) > maxHistory {
-			tracked.PriceHistory = tracked.PriceHistory[1:] // Remove oldest
+			tracked.PriceHistory = tracked.PriceHistory[1:]
 		}
 
-		// Calculate odds shift if we have enough history
+		// Calculate odds shift
 		if len(tracked.PriceHistory) >= 3 {
 			tracked.LastOddsShift = s.calculateOddsShift(tracked)
 		}
 
-		// Track peak prices for exit detection
+		// Track peak prices
 		var underdogMid, favoriteMid float64
 		if tracked.IsYesUnderdog {
 			underdogMid, favoriteMid = yesMid, noMid
@@ -412,229 +408,109 @@ func (s *Strategy) updatePricesAndTrade() {
 			tracked.PeakFavoriteMid = favoriteMid
 		}
 
-		// Update risk manager with prices for existing positions
-		s.RiskManager.UpdatePrice(tracked.TokenPair.Yes, yesMid)
-		s.RiskManager.UpdatePrice(tracked.TokenPair.No, noMid)
+		// Update risk manager with BID prices (actual exit value)
+		s.RiskManager.UpdatePrice(tracked.TokenPair.Yes, yesBid)
+		s.RiskManager.UpdatePrice(tracked.TokenPair.No, noBid)
 
-		// Check for exits first
-		s.checkExitsForDeltaNeutral(tracked, now)
+		// Check for exits (TP, SL, Peak, Scrape)
+		s.checkExitsForSports(tracked, now)
 
-		// Skip if already has position
-		if s.RiskManager.HasPositionForMarket(marketID) {
-			continue
-		}
-
-		// Look for entry opportunities (pre-game or live)
-		s.analyzeAndTradeDeltaNeutral(tracked)
+		// Look for entry or hedge opportunities
+		s.analyzeAndTradeSports(tracked)
 	}
 }
 
-func (s *Strategy) analyzeAndTradeDeltaNeutral(tracked *TrackedMarket) {
-	// Check if we have room for more sports positions (max 30 for sports)
+func (s *Strategy) analyzeAndTradeSports(tracked *TrackedMarket) {
+	// Check if we have room for more sports positions
 	if !s.RiskManager.CanAddPositionForStrategy("sports") {
-		return // Max sports positions reached
-	}
-
-	// Determine which is underdog and which is favorite
-	var underdogMid, favoriteMid float64
-	var underdogAsk, favoriteAsk float64
-	var underdogToken, favoriteToken string
-	var underdogName, favoriteName string
-
-	if tracked.IsYesUnderdog {
-		underdogMid, underdogAsk, underdogToken = tracked.YesMid, tracked.YesAsk, tracked.TokenPair.Yes
-		favoriteMid, favoriteAsk, favoriteToken = tracked.NoMid, tracked.NoAsk, tracked.TokenPair.No
-		if len(tracked.OutcomeNames) >= 2 {
-			underdogName = tracked.OutcomeNames[0]
-			favoriteName = tracked.OutcomeNames[1]
-		} else {
-			underdogName, favoriteName = "YES", "NO"
-		}
-	} else {
-		underdogMid, underdogAsk, underdogToken = tracked.NoMid, tracked.NoAsk, tracked.TokenPair.No
-		favoriteMid, favoriteAsk, favoriteToken = tracked.YesMid, tracked.YesAsk, tracked.TokenPair.Yes
-		if len(tracked.OutcomeNames) >= 2 {
-			underdogName = tracked.OutcomeNames[1]
-			favoriteName = tracked.OutcomeNames[0]
-		} else {
-			underdogName, favoriteName = "NO", "YES"
-		}
-	}
-
-	// Check for LIVE GAME opportunities first (if enabled)
-	if tracked.GameStatus == "LIVE" {
-		// LIVE GAME STRATEGY 1: Underdog odds improvement (momentum play)
-		// This is for opportunistic entries during the game
-		if s.shouldEnterOnOddsImprovement(tracked) {
-			log.Printf("Sports: 🔥 LIVE GAME - Odds Shift Detected!")
-			log.Printf("  Market: %s (%s)", truncateQuestion(tracked.Market.Question), tracked.GameStatus)
-			log.Printf("  %s (underdog): %.4f mid (shift: +%.1f%%), ask: %.4f",
-				underdogName, underdogMid, tracked.LastOddsShift*100, underdogAsk)
-
-			if s.Config.SportsDeltaNeutral {
-				s.executeDeltaNeutralEntry(tracked, underdogToken, favoriteToken, underdogAsk, favoriteAsk,
-					underdogMid, favoriteMid, underdogName, favoriteName)
-			} else {
-				s.executeSingleSideEntry(tracked, underdogToken, underdogAsk, underdogMid, underdogName)
-			}
-			return
-		}
-
-		// LIVE GAME STRATEGY 2: Late game favorite (high probability win)
-		if s.shouldEnterLateGameFavorite(tracked, favoriteMid) {
-			log.Printf("Sports: ⚡ LATE GAME FAVORITE (40+ mins)")
-			log.Printf("  Market: %s", truncateQuestion(tracked.Market.Question))
-			log.Printf("  %s (favorite): %.4f mid (%.0f%% prob), ask: %.4f",
-				favoriteName, favoriteMid, favoriteMid*100, favoriteAsk)
-
-			// Single-side entry on favorite (high conviction)
-			s.executeSingleSideEntry(tracked, favoriteToken, favoriteAsk, favoriteMid, favoriteName)
-			return
-		}
-
-		// If LIVE_GAME_ONLY mode, skip pre-game style entries
-		if s.Config.SportsLiveGameOnly {
-			return
-		}
-	}
-
-	// PRE-GAME STRATEGY: Buy FAVORITE (and optionally underdog for delta neutral)
-	// Main strategy: Buy favorite before game, sell during game when odds increase to ~100%
-	// Delta neutral: Also buy underdog to hedge against favorite losing
-
-	// DEBUG: Log actual prices for first few markets each cycle
-	combinedSpread := underdogMid + favoriteMid
-	if underdogMid > 0 && favoriteMid > 0 {
-		log.Printf("Sports: DEBUG %s [%s] | Favorite: %.4f | Underdog: %.4f | Combined: %.4f | Shift: %.2f%%",
-			truncateQuestion(tracked.Market.Question), tracked.GameStatus,
-			favoriteMid, underdogMid, combinedSpread, tracked.LastOddsShift*100)
-	}
-
-	// Check if FAVORITE is in reasonable range for pre-game entry
-	// We want to buy favorite when it's not too expensive
-	favoriteInRange := favoriteMid >= MinValidPrice && favoriteMid <= MaxFavoritePrice
-
-	// Check mode: delta neutral (buy both) or single-side (buy favorite only)
-	if s.Config.SportsDeltaNeutral {
-		// DELTA NEUTRAL MODE: Buy both sides pre-game
-		// Profit comes from selling at DIFFERENT TIMES as odds shift:
-		// - Sell losing side early (e.g., when drops 25%)
-		// - Let winning side run (e.g., sell at 95%+)
-		// - The differential timing creates profit
-		underdogInRange := underdogMid >= MinValidPrice && underdogMid <= MaxUnderdogPrice
-
-		if favoriteInRange && underdogInRange {
-			log.Printf("Sports: 💰 DELTA NEUTRAL PRE-GAME (%s)", tracked.GameStatus)
-			log.Printf("  Market: %s", truncateQuestion(tracked.Market.Question))
-			log.Printf("  %s (favorite): %.4f mid (ask: %.4f) - Sell when hits 95%%+", favoriteName, favoriteMid, favoriteAsk)
-			log.Printf("  %s (underdog): %.4f mid (ask: %.4f) - Cut early if losing", underdogName, underdogMid, underdogAsk)
-			log.Printf("  Combined: %.4f - Profit from differential exit timing", combinedSpread)
-
-			s.executeDeltaNeutralEntry(tracked, underdogToken, favoriteToken, underdogAsk, favoriteAsk, underdogMid, favoriteMid, underdogName, favoriteName)
-		}
-	} else {
-		// SINGLE-SIDE MODE: Buy favorite only
-		if favoriteInRange {
-			log.Printf("Sports: 💰 FAVORITE PRE-GAME (%s)", tracked.GameStatus)
-			log.Printf("  Market: %s", truncateQuestion(tracked.Market.Question))
-			log.Printf("  %s (favorite): %.4f mid (ask: %.4f) - Will sell when odds → 95-100%%", favoriteName, favoriteMid, favoriteAsk)
-
-			s.executeSingleSideEntry(tracked, favoriteToken, favoriteAsk, favoriteMid, favoriteName)
-		}
-	}
-}
-
-func (s *Strategy) executeDeltaNeutralEntry(
-	tracked *TrackedMarket,
-	underdogToken, favoriteToken string,
-	underdogAsk, favoriteAsk float64,
-	underdogMid, favoriteMid float64,
-	underdogName, favoriteName string,
-) {
-	// Split position equally
-	maxCost := s.Config.MaxPositionSize
-	halfCost := maxCost / 2
-
-	underdogSize := halfCost / underdogAsk
-	favoriteSize := halfCost / favoriteAsk
-
-	totalCost := (underdogAsk * underdogSize) + (favoriteAsk * favoriteSize)
-
-	// Risk check
-	if err := s.RiskManager.CheckEntry(underdogToken, underdogAsk, underdogSize); err != nil {
-		log.Printf("Sports: Risk check failed: %v", err)
 		return
 	}
 
-	if s.Config.IsDryRun() {
-		log.Printf("Sports: [DRY RUN] DELTA NEUTRAL ENTRY")
-		log.Printf("  BUY %s @ %.4f (size: %.2f, cost: $%.2f)", underdogName, underdogAsk, underdogSize, underdogAsk*underdogSize)
-		log.Printf("  BUY %s @ %.4f (size: %.2f, cost: $%.2f)", favoriteName, favoriteAsk, favoriteSize, favoriteAsk*favoriteSize)
-		log.Printf("  Total cost: $%.2f", totalCost)
+	// Identify favorite and underdog tokens
+	var underdogToken, favoriteToken string
+	var underdogAsk, favoriteAsk float64
+	var underdogMid, favoriteMid float64
+	var favoriteName string
+
+	if tracked.IsYesUnderdog {
+		underdogToken, favoriteToken = tracked.TokenPair.Yes, tracked.TokenPair.No
+		underdogAsk, favoriteAsk = tracked.YesAsk, tracked.NoAsk
+		underdogMid, favoriteMid = tracked.YesMid, tracked.NoMid
+		if len(tracked.OutcomeNames) >= 2 {
+			favoriteName = tracked.OutcomeNames[1]
+		}
 	} else {
-		// Place both orders
+		underdogToken, favoriteToken = tracked.TokenPair.No, tracked.TokenPair.Yes
+		underdogAsk, favoriteAsk = tracked.NoAsk, tracked.YesAsk
+		underdogMid, favoriteMid = tracked.NoMid, tracked.YesMid
+		if len(tracked.OutcomeNames) >= 2 {
+			favoriteName = tracked.OutcomeNames[0]
+		}
+	}
+
+	// Check if already has ANY position in this market
+	hasUnderdog := s.RiskManager.GetPositionByToken(underdogToken) != nil
+	hasFavorite := s.RiskManager.GetPositionByToken(favoriteToken) != nil
+
+	// DYNAMIC HEDGING LOGIC (Gabagool Sports)
+	// Case 1: Already holding Favorite, check for Arb opportunity on Underdog
+	if hasFavorite && !hasUnderdog {
+		// Get the favorite entry price
+		favPos := s.RiskManager.GetPositionByToken(favoriteToken)[0]
+
+		// Arb exists if entryFav + currentUnderdogAsk < 0.98 (locked profit)
+		if favPos.EntryPrice+underdogAsk <= 0.98 {
+			log.Printf("Sports: 🍖 HEDGE ARB - %s (Favorite @ %.4f + Underdog Ask @ %.4f = %.4f)",
+				favoriteName, favPos.EntryPrice, underdogAsk, favPos.EntryPrice+underdogAsk)
+			s.executeSecondLeg(tracked, underdogToken, underdogAsk, underdogMid, "Underdog")
+		}
+		return
+	}
+
+	// Case 2: No positions, look for initial Favorite entry
+	if !hasFavorite && !hasUnderdog {
+		// Entry criteria for Favorite
+		if favoriteMid <= MaxFavoritePrice && favoriteMid >= MinValidPrice {
+			log.Printf("Sports: 🎯 ENTRY FAVORITE - %s @ %.4f (ask: %.4f)",
+				favoriteName, favoriteMid, favoriteAsk)
+			s.executeSingleSideEntry(tracked, favoriteToken, favoriteAsk, favoriteMid, favoriteName)
+		}
+	}
+}
+
+// executeSecondLeg completes the arb/delta-neutral position
+func (s *Strategy) executeSecondLeg(tracked *TrackedMarket, tokenID string, ask, mid float64, name string) {
+	maxCost := s.Config.MaxPositionSize / 2
+	size := maxCost / ask
+
+	if s.Config.IsDryRun() {
+		log.Printf("Sports: [DRY RUN] HEDGING %s @ %.4f (size: %.2f)", name, ask, size)
+	} else {
 		_, err := s.ClobClient.CreateOrder(clob.CreateOrderRequest{
-			TokenID:   underdogToken,
-			Price:     underdogAsk,
-			Size:      underdogSize,
+			TokenID:   tokenID,
+			Price:     ask,
+			Size:      size,
 			Side:      clob.Buy,
 			OrderType: clob.Limit,
 		})
 		if err != nil {
-			log.Printf("Sports: Underdog order failed: %v", err)
-			return
-		}
-
-		_, err = s.ClobClient.CreateOrder(clob.CreateOrderRequest{
-			TokenID:   favoriteToken,
-			Price:     favoriteAsk,
-			Size:      favoriteSize,
-			Side:      clob.Buy,
-			OrderType: clob.Limit,
-		})
-		if err != nil {
-			log.Printf("Sports: Favorite order failed: %v", err)
+			log.Printf("Sports: Hedge order failed: %v", err)
 			return
 		}
 	}
 
-	// Track positions as paired
-	underdogPos := &risk.Position{
+	pos := &risk.Position{
 		MarketID:     tracked.Market.ID,
-		TokenID:      underdogToken,
-		OutcomeName:  underdogName,
-		Size:         underdogSize,
-		EntryPrice:   underdogMid,
-		CurrentPrice: underdogMid,
+		TokenID:      tokenID,
+		OutcomeName:  name,
+		Size:         size,
+		EntryPrice:   mid,
+		CurrentPrice: mid,
 		Side:         "BUY",
-		Type:         risk.TypeDeltaNeutral,
+		Type:         risk.TypeArbitrage,
 		Strategy:     "sports",
-		TotalCost:    totalCost,
 	}
-	underdogID := s.RiskManager.AddPosition(underdogPos)
-
-	favoritePos := &risk.Position{
-		MarketID:         tracked.Market.ID,
-		TokenID:          favoriteToken,
-		OutcomeName:      favoriteName,
-		Size:             favoriteSize,
-		EntryPrice:       favoriteMid,
-		CurrentPrice:     favoriteMid,
-		Side:             "BUY",
-		Type:             risk.TypeDeltaNeutral,
-		Strategy:         "sports",
-		TotalCost:        totalCost,
-		PairedPositionID: underdogID,
-	}
-	favoriteID := s.RiskManager.AddPosition(favoritePos)
-
-	// Link the underdog to favorite
-	if uPos := s.RiskManager.GetPosition(underdogID); uPos != nil {
-		uPos.PairedPositionID = favoriteID
-	}
-
-	tracked.HasPosition = true
-	log.Printf("Sports: ✅ Delta neutral position opened - Total cost: $%.2f", totalCost)
+	s.RiskManager.AddPosition(pos)
 }
 
 // executeSingleSideEntry buys only the underdog side (no delta neutral)
@@ -690,7 +566,7 @@ func (s *Strategy) executeSingleSideEntry(
 	log.Printf("Sports: ✅ Single-side position opened - Cost: $%.2f", totalCost)
 }
 
-func (s *Strategy) checkExitsForDeltaNeutral(tracked *TrackedMarket, now time.Time) {
+func (s *Strategy) checkExitsForSports(tracked *TrackedMarket, now time.Time) {
 	positions := s.RiskManager.GetPositionsByStrategy("sports")
 
 	var marketPositions []*risk.Position
@@ -704,178 +580,83 @@ func (s *Strategy) checkExitsForDeltaNeutral(tracked *TrackedMarket, now time.Ti
 		return
 	}
 
-	// LIVE GAME EXIT STRATEGY 1: Sell favorite when odds → 95-100%
-	// This is the main profit mechanism for pre-game favorite entries
-	// Exit BOTH positions when favorite reaches 95%+
-	if tracked.GameStatus == "LIVE" {
+	// 1. SCRAPE CENTS LOGIC (Guaranteed Profit)
+	// If we hold both sides (hedged), check if we can exit for combined profit
+	if len(marketPositions) >= 2 {
+		totalCost, totalValue := 0.0, 0.0
 		for _, pos := range marketPositions {
-			// Skip grace period
-			if now.Sub(pos.EntryTime) < EntryGracePeriod {
-				continue
-			}
-
-			var currentPrice float64
-			var isFavorite bool
-
-			// Determine if this position is the favorite
-			if tracked.IsYesUnderdog {
-				// No is favorite
-				isFavorite = pos.TokenID == tracked.TokenPair.No
-				if isFavorite {
-					currentPrice = tracked.NoMid
-				} else {
-					currentPrice = tracked.YesMid
-				}
-			} else {
-				// Yes is favorite
-				isFavorite = pos.TokenID == tracked.TokenPair.Yes
-				if isFavorite {
-					currentPrice = tracked.YesMid
-				} else {
-					currentPrice = tracked.NoMid
-				}
-			}
-
-			pos.CurrentPrice = currentPrice
-			pnlPercent := (currentPrice - pos.EntryPrice) / pos.EntryPrice
-
-			// If this is a favorite position and odds are now 95%+, sell BOTH for profit
-			if isFavorite && currentPrice >= 0.95 {
-				log.Printf("Sports: 💎 FAVORITE AT 95%%+ - Closing full position!")
-				log.Printf("  %s (favorite) @ %.4f (entry: %.4f, +%.1f%%)",
-					pos.OutcomeName, currentPrice, pos.EntryPrice, pnlPercent*100)
-				s.executeExit(pos)
-
-				// Also exit paired position if delta neutral
-				if pos.PairedPositionID != "" {
-					if pairedPos := s.RiskManager.GetPosition(pos.PairedPositionID); pairedPos != nil {
-						if pairedPos.State == risk.StateOpen {
-							var pairedPrice float64
-							if pairedPos.TokenID == tracked.TokenPair.Yes {
-								pairedPrice = tracked.YesMid
-							} else {
-								pairedPrice = tracked.NoMid
-							}
-							pairedPos.CurrentPrice = pairedPrice
-							pairedPnlPercent := (pairedPrice - pairedPos.EntryPrice) / pairedPos.EntryPrice
-
-							log.Printf("  %s (underdog) @ %.4f (entry: %.4f, %.1f%%) - Closing hedge",
-								pairedPos.OutcomeName, pairedPrice, pairedPos.EntryPrice, pairedPnlPercent*100)
-							s.executeExit(pairedPos)
-						}
-					}
-				}
-				tracked.HasPosition = false
-				return
-			}
-		}
-	}
-
-	// LIVE GAME EXIT STRATEGY 2: Check for peak detection (odds reversal)
-	if tracked.GameStatus == "LIVE" && s.detectPeakAndExit(tracked) {
-		log.Printf("Sports: 📊 PEAK DETECTED - Odds reversing, exiting all positions")
-		for _, pos := range marketPositions {
-			var currentPrice float64
+			totalCost += pos.EntryPrice * pos.Size
 			if pos.TokenID == tracked.TokenPair.Yes {
-				currentPrice = tracked.YesMid
+				totalValue += tracked.YesBid * pos.Size
 			} else {
-				currentPrice = tracked.NoMid
+				totalValue += tracked.NoBid * pos.Size
 			}
-
-			pos.CurrentPrice = currentPrice
-			pnlPercent := (currentPrice - pos.EntryPrice) / pos.EntryPrice
-
-			log.Printf("  %s @ %.4f (entry: %.4f, %.1f%%)",
-				pos.OutcomeName, currentPrice, pos.EntryPrice, pnlPercent*100)
-			s.executeExit(pos)
-		}
-		tracked.HasPosition = false
-		return
-	}
-
-	// Check for TAKE PROFIT - exit BOTH positions (strategy complete)
-	for _, pos := range marketPositions {
-		// Grace period
-		if now.Sub(pos.EntryTime) < EntryGracePeriod {
-			continue
 		}
 
-		// Get current price
-		var currentPrice float64
-		if pos.TokenID == tracked.TokenPair.Yes {
-			currentPrice = tracked.YesMid
-		} else {
-			currentPrice = tracked.NoMid
-		}
-
-		if currentPrice < MinValidPrice {
-			continue
-		}
-
-		pos.CurrentPrice = currentPrice
-		pnlPercent := (currentPrice - pos.EntryPrice) / pos.EntryPrice
-
-		// If ANY position hit take profit, exit BOTH (strategy successful)
-		if pnlPercent >= s.Config.TakeProfitPercent {
-			log.Printf("Sports: 🎯 TAKE PROFIT - Closing full position")
-			log.Printf("  %s @ %.4f (entry: %.4f, +%.1f%%)",
-				pos.OutcomeName, currentPrice, pos.EntryPrice, pnlPercent*100)
-
-			// Exit this position
-			s.executeExit(pos)
-
-			// Exit paired position too
-			if pos.PairedPositionID != "" {
-				if pairedPos := s.RiskManager.GetPosition(pos.PairedPositionID); pairedPos != nil {
-					if pairedPos.State == risk.StateOpen {
-						var pairedPrice float64
-						if pairedPos.TokenID == tracked.TokenPair.Yes {
-							pairedPrice = tracked.YesMid
-						} else {
-							pairedPrice = tracked.NoMid
-						}
-						pairedPos.CurrentPrice = pairedPrice
-						pairedPnlPercent := (pairedPrice - pairedPos.EntryPrice) / pairedPos.EntryPrice
-
-						log.Printf("  %s @ %.4f (entry: %.4f, %.1f%%)",
-							pairedPos.OutcomeName, pairedPrice, pairedPos.EntryPrice, pairedPnlPercent*100)
-						s.executeExit(pairedPos)
-					}
-				}
+		profitPercent := (totalValue - totalCost) / totalCost
+		// If guaranteed profit exceeds 2%, take it and "scrape"
+		if profitPercent >= 0.02 {
+			log.Printf("Sports: 🤏 SCRAPE CENTS - Combined profit @ %.1f%%, closing all", profitPercent*100)
+			for _, pos := range marketPositions {
+				s.executeExit(pos)
 			}
 			tracked.HasPosition = false
 			return
 		}
 	}
 
-	// INDEPENDENT STOP LOSS - Each position can exit on its own stop-loss
-	// This allows closing a losing underdog while holding a winning favorite
+	// 2. INDEPENDENT POSITION MONITORING (TP, SL, Peak)
 	for _, pos := range marketPositions {
 		if now.Sub(pos.EntryTime) < EntryGracePeriod {
 			continue
 		}
 
-		var currentPrice float64
+		var currentExitPrice float64
 		if pos.TokenID == tracked.TokenPair.Yes {
-			currentPrice = tracked.YesMid
+			currentExitPrice = tracked.YesBid
 		} else {
-			currentPrice = tracked.NoMid
+			currentExitPrice = tracked.NoBid
 		}
 
-		pos.CurrentPrice = currentPrice
-		pnlPercent := (currentPrice - pos.EntryPrice) / pos.EntryPrice
+		pos.CurrentPrice = currentExitPrice
+		pnlPercent := (currentExitPrice - pos.EntryPrice) / pos.EntryPrice
 
-		// INDEPENDENT exit if this position hits stop-loss
-		// Don't close the paired position - let it run independently
-		if pnlPercent <= -s.Config.StopLossPercent {
-			log.Printf("Sports: 🛑 STOP LOSS (independent) - %s @ %.4f (entry: %.4f, %.1f%%)",
-				pos.OutcomeName, currentPrice, pos.EntryPrice, pnlPercent*100)
-			log.Printf("  Paired position continues independently")
+		// TAKE PROFIT (Target 95%+)
+		if currentExitPrice >= 0.95 || pnlPercent >= s.Config.TakeProfitPercent {
+			log.Printf("Sports: 🎯 EXIT TARGET - %s @ %.4f (entry: %.4f, +%.1f%%)",
+				pos.OutcomeName, currentExitPrice, pos.EntryPrice, pnlPercent*100)
 			s.executeExit(pos)
 
-			// Note: We do NOT close the paired position here
-			// This allows the winning side to continue running
+			// If this was part of a hedged pair, we might want to close the other side too
+			// to fully "scrape" the win.
+			if len(marketPositions) >= 2 {
+				log.Printf("  Closing hedge partner to capture full arb profit")
+				for _, other := range marketPositions {
+					if other.ID != pos.ID && other.State == risk.StateOpen {
+						s.executeExit(other)
+					}
+				}
+			}
+			tracked.HasPosition = false
+			return
 		}
+
+		// STOP LOSS (Independent)
+		if pnlPercent <= -s.Config.StopLossPercent {
+			log.Printf("Sports: 🛑 STOP LOSS - %s @ %.4f (entry: %.4f, %.1f%%)",
+				pos.OutcomeName, currentExitPrice, pos.EntryPrice, pnlPercent*100)
+			s.executeExit(pos)
+			// Let the other side run (it's either a hedge or a winning bet)
+		}
+	}
+
+	// 3. PEAK DETECTION (Dynamic Reversal for Underdogs)
+	if tracked.GameStatus == "LIVE" && s.detectPeakAndExit(tracked) {
+		log.Printf("Sports: 📊 PEAK DETECTED - Odds reversing, exiting remaining positions")
+		for _, pos := range marketPositions {
+			s.executeExit(pos)
+		}
+		tracked.HasPosition = false
 	}
 }
 

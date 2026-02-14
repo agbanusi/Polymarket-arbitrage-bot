@@ -241,12 +241,12 @@ func (c *Client) GetMidpoint(tokenID string) (float64, error) {
 	return (bestBid + bestAsk) / 2, nil
 }
 
-// GetBestBid returns the highest bid price
+// GetBestBid returns the highest bid price (what you can SELL at as a taker)
 func (c *Client) GetBestBid(tokenID string) (float64, error) {
 	return c.GetPrice(tokenID, Buy)
 }
 
-// GetBestAsk returns the lowest ask price
+// GetBestAsk returns the lowest ask price (what you can BUY at as a taker)
 func (c *Client) GetBestAsk(tokenID string) (float64, error) {
 	return c.GetPrice(tokenID, Sell)
 }
