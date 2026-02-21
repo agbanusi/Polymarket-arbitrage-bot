@@ -8,6 +8,7 @@ import (
 	"polymarket-bot/internal/clients/clob"
 	"polymarket-bot/internal/clients/gamma"
 	"polymarket-bot/internal/risk"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -412,20 +413,41 @@ func (s *Strategy) updatePricesAndTrade() {
 		s.RiskManager.UpdatePrice(tracked.TokenPair.Yes, yesBid)
 		s.RiskManager.UpdatePrice(tracked.TokenPair.No, noBid)
 
-		// Check for exits (TP, SL, Peak, Scrape)
+		// Check for exits first (freeing up slots)
 		s.checkExitsForSports(tracked, now)
+	}
 
+	// === PRIORITY RANKING FOR ENTRIES ===
+	// We want to sort markets so we check the most profitable ones first
+	var rankedMarkets []*TrackedMarket
+
+	for _, tracked := range s.trackedMarkets {
+		if tracked.Market.Closed || (!tracked.GameTime.IsZero() && now.After(tracked.GameTime.Add(6*time.Hour))) {
+			continue // Already handled in the cleanup loop
+		}
+
+		// Only consider markets where we have valid ask prices
+		if tracked.YesAsk > 0 && tracked.NoAsk > 0 {
+			rankedMarkets = append(rankedMarkets, tracked)
+		}
+	}
+
+	// Sort explicitly by potential arbitrage spread (YesAsk + NoAsk) ascending
+	// Smaller combinedAsk = better arbitrage spread
+	sort.Slice(rankedMarkets, func(i, j int) bool {
+		askI := rankedMarkets[i].YesAsk + rankedMarkets[i].NoAsk
+		askJ := rankedMarkets[j].YesAsk + rankedMarkets[j].NoAsk
+		return askI < askJ
+	})
+
+	// Now try to enter trades in order of profitability
+	for _, tracked := range rankedMarkets {
 		// Look for entry or hedge opportunities
 		s.analyzeAndTradeSports(tracked)
 	}
 }
 
 func (s *Strategy) analyzeAndTradeSports(tracked *TrackedMarket) {
-	// Check if we have room for more sports positions
-	if !s.RiskManager.CanAddPositionForStrategy("sports") {
-		return
-	}
-
 	// Identify favorite and underdog tokens
 	var underdogToken, favoriteToken string
 	var underdogAsk, favoriteAsk float64
@@ -449,25 +471,59 @@ func (s *Strategy) analyzeAndTradeSports(tracked *TrackedMarket) {
 	}
 
 	// Check if already has ANY position in this market
-	hasUnderdog := s.RiskManager.GetPositionByToken(underdogToken) != nil
-	hasFavorite := s.RiskManager.GetPositionByToken(favoriteToken) != nil
+	hasUnderdog := len(s.RiskManager.GetPositionByToken(underdogToken)) > 0
+	hasFavorite := len(s.RiskManager.GetPositionByToken(favoriteToken)) > 0
 
-	// DYNAMIC HEDGING LOGIC (Gabagool Sports)
-	// Case 1: Already holding Favorite, check for Arb opportunity on Underdog
+	// Check if we have room for more sports positions
+	if !s.RiskManager.CanAddPositionForStrategy("sports") {
+		return
+	}
+
+	// === 1. SIMULTANEOUS SPREAD ARBITRAGE (PRIORITY) ===
+	combinedAsk := tracked.YesAsk + tracked.NoAsk
+
+	// If AskYes + AskNo < 1.0 (minus fees), there's guaranteed profit if filled
+	maxSpread := 0.98 // Can make this configurable later
+	if combinedAsk > 0 && combinedAsk < maxSpread && !hasUnderdog && !hasFavorite {
+		log.Printf("Sports: 💰 SPREAD ARB FOUND - Market: %s (AskYes: %.4f + AskNo: %.4f = %.4f)",
+			truncateQuestion(tracked.Market.Question), tracked.YesAsk, tracked.NoAsk, combinedAsk)
+
+		s.executeSpreadArb(tracked)
+		return
+	}
+
+	// === 2. DYNAMIC HEDGING LOGIC (Gabagool Sports Fallback) ===
+
+	// Case 2A: Already holding Favorite, check for Arb opportunity on Underdog
 	if hasFavorite && !hasUnderdog {
-		// Get the favorite entry price
-		favPos := s.RiskManager.GetPositionByToken(favoriteToken)[0]
-
-		// Arb exists if entryFav + currentUnderdogAsk < 0.98 (locked profit)
-		if favPos.EntryPrice+underdogAsk <= 0.98 {
-			log.Printf("Sports: 🍖 HEDGE ARB - %s (Favorite @ %.4f + Underdog Ask @ %.4f = %.4f)",
-				favoriteName, favPos.EntryPrice, underdogAsk, favPos.EntryPrice+underdogAsk)
-			s.executeSecondLeg(tracked, underdogToken, underdogAsk, underdogMid, "Underdog")
+		favPositions := s.RiskManager.GetPositionByToken(favoriteToken)
+		if len(favPositions) > 0 {
+			favPos := favPositions[0]
+			if favPos.EntryPrice+underdogAsk <= maxSpread {
+				log.Printf("Sports: 🍖 HEDGE ARB - %s (Favorite @ %.4f + Underdog Ask @ %.4f = %.4f)",
+					favoriteName, favPos.EntryPrice, underdogAsk, favPos.EntryPrice+underdogAsk)
+				s.executeSecondLeg(tracked, underdogToken, underdogAsk, underdogMid, "Underdog")
+			}
 		}
 		return
 	}
 
-	// Case 2: No positions, look for initial Favorite entry
+	// Case 2B: Already holding Underdog, check for Arb opportunity on Favorite
+	if hasUnderdog && !hasFavorite {
+		dogPositions := s.RiskManager.GetPositionByToken(underdogToken)
+		if len(dogPositions) > 0 {
+			dogPos := dogPositions[0]
+			if dogPos.EntryPrice+favoriteAsk <= maxSpread {
+				log.Printf("Sports: 🍖 HEDGE ARB - %s (Underdog @ %.4f + Favorite Ask @ %.4f = %.4f)",
+					"Underdog", dogPos.EntryPrice, favoriteAsk, dogPos.EntryPrice+favoriteAsk)
+				s.executeSecondLeg(tracked, favoriteToken, favoriteAsk, favoriteMid, favoriteName)
+			}
+		}
+		return
+	}
+
+	// === 3. FIRST LEG / ENTRY ===
+	// Case 3C: No positions, look for initial Favorite entry
 	if !hasFavorite && !hasUnderdog {
 		// Entry criteria for Favorite
 		if favoriteMid <= MaxFavoritePrice && favoriteMid >= MinValidPrice {
@@ -476,6 +532,128 @@ func (s *Strategy) analyzeAndTradeSports(tracked *TrackedMarket) {
 			s.executeSingleSideEntry(tracked, favoriteToken, favoriteAsk, favoriteMid, favoriteName)
 		}
 	}
+}
+
+// executeSpreadArb executes a full spread arbitrage (both legs immediately)
+// Uses EQUAL SHARE QUANTITIES to ensure guaranteed profit
+func (s *Strategy) executeSpreadArb(tracked *TrackedMarket) {
+	yesPrice := tracked.YesAsk
+	noPrice := tracked.NoAsk
+
+	// Calculate sizes - EQUAL SHARE QUANTITIES
+	maxCost := s.Config.MaxPositionSize
+	halfCost := maxCost / 2
+
+	yesSharesMax := halfCost / yesPrice
+	noSharesMax := halfCost / noPrice
+
+	shareQty := yesSharesMax
+	if noSharesMax < yesSharesMax {
+		shareQty = noSharesMax
+	}
+
+	yesCost := shareQty * yesPrice
+	noCost := shareQty * noPrice
+	totalCost := yesCost + noCost
+	potentialPayout := shareQty
+	fees := totalCost * s.Config.TradingFeePercent
+	guaranteedProfit := potentialPayout - totalCost - fees
+	profitPercent := guaranteedProfit / totalCost
+
+	if profitPercent < s.Config.MinProfitAfterFees {
+		log.Printf("Sports: SKIP spread arb - profit %.2f%% below min %.2f%% (fees: $%.4f)",
+			profitPercent*100, s.Config.MinProfitAfterFees*100, fees)
+		return
+	}
+
+	if guaranteedProfit <= 0 {
+		return
+	}
+
+	// Risk check
+	if err := s.RiskManager.CheckEntry(tracked.TokenPair.Yes, yesPrice, shareQty); err != nil {
+		log.Printf("Sports: Risk check failed: %v", err)
+		return
+	}
+
+	if s.Config.IsDryRun() {
+		log.Printf("Sports: [DRY RUN] SPREAD ARB (Equal shares: %.2f)", shareQty)
+		log.Printf("  YES @ %.4f × %.2f shares = $%.2f", yesPrice, shareQty, yesCost)
+		log.Printf("  NO @ %.4f × %.2f shares = $%.2f", noPrice, shareQty, noCost)
+		log.Printf("  Total cost: $%.2f, Guaranteed profit: $%.4f (%.2f%%)",
+			totalCost, guaranteedProfit, profitPercent*100)
+	} else {
+		// Execute both orders
+		_, err := s.ClobClient.CreateOrder(clob.CreateOrderRequest{
+			TokenID:   tracked.TokenPair.Yes,
+			Price:     yesPrice,
+			Size:      shareQty,
+			Side:      clob.Buy,
+			OrderType: clob.Limit,
+		})
+		if err != nil {
+			log.Printf("Sports: YES order failed: %v", err)
+			return
+		}
+
+		_, err = s.ClobClient.CreateOrder(clob.CreateOrderRequest{
+			TokenID:   tracked.TokenPair.No,
+			Price:     noPrice,
+			Size:      shareQty,
+			Side:      clob.Buy,
+			OrderType: clob.Limit,
+		})
+		if err != nil {
+			log.Printf("Sports: NO order failed: %v", err)
+			return
+		}
+	}
+
+	// Track both positions
+	var yesName, noName string
+	if len(tracked.OutcomeNames) >= 2 {
+		yesName = tracked.OutcomeNames[0]
+		noName = tracked.OutcomeNames[1]
+	} else {
+		yesName = "Yes"
+		noName = "No"
+	}
+
+	yesPos := &risk.Position{
+		MarketID:     tracked.Market.ID,
+		TokenID:      tracked.TokenPair.Yes,
+		OutcomeName:  yesName,
+		Size:         shareQty,
+		EntryPrice:   yesPrice,
+		CurrentPrice: yesPrice,
+		Side:         "BUY",
+		Type:         risk.TypeArbitrage,
+		Strategy:     "sports",
+		TotalCost:    yesCost,
+	}
+	yesID := s.RiskManager.AddPosition(yesPos)
+
+	noPos := &risk.Position{
+		MarketID:         tracked.Market.ID,
+		TokenID:          tracked.TokenPair.No,
+		OutcomeName:      noName,
+		Size:             shareQty,
+		EntryPrice:       noPrice,
+		CurrentPrice:     noPrice,
+		Side:             "BUY",
+		Type:             risk.TypeArbitrage,
+		Strategy:         "sports",
+		TotalCost:        noCost,
+		PairedPositionID: yesID, // Link to YES position
+	}
+	noID := s.RiskManager.AddPosition(noPos)
+
+	if yesPosition := s.RiskManager.GetPosition(yesID); yesPosition != nil {
+		yesPosition.PairedPositionID = noID
+	}
+
+	tracked.HasPosition = true
+	log.Printf("Sports: Spread arb executed - %.2f shares each side, guaranteed profit: $%.4f", shareQty, guaranteedProfit)
 }
 
 // executeSecondLeg completes the arb/delta-neutral position
@@ -694,11 +872,4 @@ func truncateQuestion(q string) string {
 		return q[:57] + "..."
 	}
 	return q
-}
-
-func (s *Strategy) GetStatus() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	openPositions := len(s.RiskManager.GetPositionsByStrategy("sports"))
-	return fmt.Sprintf("Sports: %d moneylines, %d positions", len(s.trackedMarkets), openPositions)
 }

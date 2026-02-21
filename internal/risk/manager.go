@@ -28,10 +28,12 @@ const (
 
 // Position limits
 const (
-	MaxPositions         = 30 // Total max positions across all strategies
-	MaxCryptoPositions   = 10 // Crypto: only high-conviction 15min/1hr/4hr trades
-	MaxSportsPositions   = 20 // Sports/O/U: increased for live game opportunities
-	MaxCrossArbPositions = 10 // Cross-platform arb positions
+	MaxPositions         = 30               // Total max positions across all strategies
+	BaseCryptoPositions  = 5                // Base limit for crypto
+	BaseSportsPositions  = 15               // Base limit for sports
+	BaseOUPositions      = 10               // Base limit for over/under
+	MaxCrossArbPositions = 10               // Cross-platform arb positions
+	IdleSlotTime         = 30 * time.Minute // Time before unused slots become "free"
 )
 
 // Position represents an open position
@@ -76,13 +78,17 @@ type Manager struct {
 
 	// Realized P&L tracking
 	RealizedPnL float64
+
+	// Slot tracking per strategy
+	StrategyLastTradeTime map[string]time.Time
 }
 
 // NewManager creates a new risk manager
 func NewManager(cfg *config.Config) *Manager {
 	return &Manager{
-		Config:    cfg,
-		Positions: make(map[string]*Position),
+		Config:                cfg,
+		Positions:             make(map[string]*Position),
+		StrategyLastTradeTime: make(map[string]time.Time),
 	}
 }
 
@@ -157,28 +163,63 @@ func (m *Manager) CanAddPosition() bool {
 	return m.GetOpenPositionCount() < MaxPositions
 }
 
-// CanAddPositionForStrategy checks if we can add more positions for a specific strategy
+// CanAddPositionForStrategy checks if we can add more positions, using dynamic free slots algorithm
 func (m *Manager) CanAddPositionForStrategy(strategy string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	// Check total limit first
-	if m.getOpenPositionCountUnsafe() >= MaxPositions {
+	totalOpen := m.getOpenPositionCountUnsafe()
+	if totalOpen >= MaxPositions {
 		return false
 	}
 
-	// Check per-strategy limits
 	count := m.getPositionCountByStrategyUnsafe(strategy)
-	switch strategy {
-	case "crypto":
-		return count < MaxCryptoPositions
-	case "sports", "overunder":
-		return count < MaxSportsPositions
-	case "crossarb":
+
+	// Cross arb has dedicated parallel slots
+	if strategy == "crossarb" {
 		return count < MaxCrossArbPositions
-	default:
+	}
+
+	// Calculate base allocations
+	baseAllocations := map[string]int{
+		"crypto":    BaseCryptoPositions,
+		"sports":    BaseSportsPositions,
+		"overunder": BaseOUPositions,
+	}
+
+	baseLimit := baseAllocations[strategy]
+
+	// 1. If we haven't reached our base limit, we can trade
+	if count < baseLimit {
 		return true
 	}
+
+	// 2. We've reached base limit, check for free slots from other inactive strategies
+	freeSlots := 0
+	now := time.Now()
+
+	for strat, limit := range baseAllocations {
+		if strat == strategy {
+			continue // don't check our own slots
+		}
+
+		stratOpenCount := m.getPositionCountByStrategyUnsafe(strat)
+
+		// Check if strategy is idle
+		lastActive, activeRecorded := m.StrategyLastTradeTime[strat]
+		isIdle := !activeRecorded || now.Sub(lastActive) >= IdleSlotTime
+
+		if isIdle && stratOpenCount < limit {
+			freeSlots += (limit - stratOpenCount)
+		}
+	}
+
+	if freeSlots > 0 {
+		log.Printf("Risk: Strategy %s borrowing idle slot (Base limit %d reached. Free slots available: %d)", strategy, baseLimit, freeSlots)
+		return true // Borrow an idle slot
+	}
+
+	return false // No slots available, and base limit reached
 }
 
 // AddPosition adds a new position
@@ -195,6 +236,9 @@ func (m *Manager) AddPosition(pos *Position) string {
 	pos.LastUpdate = time.Now()
 	pos.HighestPrice = pos.EntryPrice
 
+	// Mark strategy as active
+	m.StrategyLastTradeTime[pos.Strategy] = time.Now()
+
 	// Calculate stop loss and take profit prices
 	if pos.Side == "BUY" {
 		pos.StopLossPrice = pos.EntryPrice * (1 - m.Config.StopLossPercent)
@@ -206,8 +250,8 @@ func (m *Manager) AddPosition(pos *Position) string {
 
 	m.Positions[pos.ID] = pos
 
-	log.Printf("Risk: Added position %s - %s @ %.4f (SL: %.4f, TP: %.4f)",
-		pos.ID, pos.OutcomeName, pos.EntryPrice, pos.StopLossPrice, pos.TakeProfitPrice)
+	log.Printf("Risk: Added position %s - %s @ %.4f (SL: %.4f, TP: %.4f, Strategy: %s)",
+		pos.ID, pos.OutcomeName, pos.EntryPrice, pos.StopLossPrice, pos.TakeProfitPrice, pos.Strategy)
 
 	return pos.ID
 }

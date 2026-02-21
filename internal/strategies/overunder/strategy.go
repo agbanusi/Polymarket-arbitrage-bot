@@ -8,6 +8,7 @@ import (
 	"polymarket-bot/internal/clients/clob"
 	"polymarket-bot/internal/clients/gamma"
 	"polymarket-bot/internal/risk"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -17,7 +18,7 @@ import (
 // Profit comes from selling at different times as game total shifts
 const (
 	MaxOverPrice     = 0.60 // Buy Over if < 60%
-	MaxUnderPrice    = 0.60 // Buy Under if < 40%
+	MaxUnderPrice    = 0.50 // Buy Under if < 40%
 	MinValidPrice    = 0.05
 	MaxSpreadPercent = 1.50
 	EntryGracePeriod = 60 * time.Second
@@ -337,60 +338,155 @@ func (s *Strategy) updatePricesAndTrade() {
 		if s.RiskManager.HasPositionForMarket(marketID) {
 			continue
 		}
+	}
 
+	// === PRIORITY RANKING FOR ENTRIES ===
+	// We want to sort markets so we check the most profitable ones first
+	var rankedMarkets []*TrackedMarket
+
+	for _, tracked := range s.trackedMarkets {
+		if tracked.Market.Closed || (!tracked.GameTime.IsZero() && now.After(tracked.GameTime.Add(6*time.Hour))) {
+			continue // Already handled in the cleanup loop
+		}
+
+		// Only consider markets where we have valid ask prices
+		if tracked.OverAsk > 0 && tracked.UnderAsk > 0 {
+			rankedMarkets = append(rankedMarkets, tracked)
+		}
+	}
+
+	// Sort explicitly by potential arbitrage spread (OverAsk + UnderAsk) ascending
+	// Smaller combinedAsk = better arbitrage spread
+	sort.Slice(rankedMarkets, func(i, j int) bool {
+		askI := rankedMarkets[i].OverAsk + rankedMarkets[i].UnderAsk
+		askJ := rankedMarkets[j].OverAsk + rankedMarkets[j].UnderAsk
+		return askI < askJ
+	})
+
+	// Now try to enter trades in order of profitability
+	for _, tracked := range rankedMarkets {
 		s.analyzeAndTradeDeltaNeutral(tracked)
 	}
 }
 
 func (s *Strategy) analyzeAndTradeDeltaNeutral(tracked *TrackedMarket) {
-	// Check if we have room for more O/U positions (shares limit with sports: max 25 combined)
+	// Check if we have room for more O/U positions
 	if !s.RiskManager.CanAddPositionForStrategy("overunder") {
-		return // Max sports/O/U positions reached
+		return
 	}
 
-	overInRange := tracked.OverMid >= MinValidPrice && tracked.OverMid <= MaxOverPrice
-	underInRange := tracked.UnderMid >= MinValidPrice && tracked.UnderMid <= MaxUnderPrice
+	overAsk, underAsk := tracked.OverAsk, tracked.UnderAsk
 
-	combinedSpread := tracked.OverMid + tracked.UnderMid
+	hasOver := len(s.RiskManager.GetPositionByToken(tracked.TokenPair.Yes)) > 0
+	hasUnder := len(s.RiskManager.GetPositionByToken(tracked.TokenPair.No)) > 0
 
-	// Buy both sides - profit comes from selling at different times as game total shifts
-	// e.g., if game goes high-scoring, Over rises while Under falls
-	// Sell Under early (cut losses), let Over run, then sell at peak
-	if overInRange && underInRange {
-		log.Printf("O/U: 💰 DELTA NEUTRAL OPPORTUNITY")
-		log.Printf("  Market: %s", truncateQuestion(tracked.Market.Question))
-		log.Printf("  OVER: %.4f mid (ask: %.4f) - Sell if game goes low-scoring", tracked.OverMid, tracked.OverAsk)
-		log.Printf("  UNDER: %.4f mid (ask: %.4f) - Sell if game goes high-scoring", tracked.UnderMid, tracked.UnderAsk)
-		log.Printf("  Combined: %.4f - Profit from differential exit timing", combinedSpread)
+	// If we already hold both, nothing to do
+	if hasOver && hasUnder {
+		return
+	}
 
-		s.executeDeltaNeutralEntry(tracked)
+	// === 1. SIMULTANEOUS SPREAD ARBITRAGE (PRIORITY) ===
+	combinedAsk := overAsk + underAsk
+	maxSpread := 0.98 // Allow 2% room for fees
+
+	if combinedAsk > 0 && combinedAsk < maxSpread && !hasOver && !hasUnder {
+		log.Printf("O/U: 💰 SPREAD ARB FOUND - Market: %s (OverAsk: %.4f + UnderAsk: %.4f = %.4f)",
+			truncateQuestion(tracked.Market.Question), overAsk, underAsk, combinedAsk)
+		s.executeSpreadArb(tracked)
+		return
+	}
+
+	// === 2. SECOND LEG / HEDGE ===
+	if hasOver && !hasUnder {
+		overPos := s.RiskManager.GetPositionByToken(tracked.TokenPair.Yes)[0]
+		if overPos.EntryPrice+underAsk <= maxSpread {
+			log.Printf("O/U: 🍖 HEDGE ARB - %s (Over @ %.4f + Under Ask @ %.4f = %.4f)",
+				tracked.TotalLine, overPos.EntryPrice, underAsk, overPos.EntryPrice+underAsk)
+			s.executeSecondLeg(tracked, "UNDER", tracked.TokenPair.No, underAsk, tracked.UnderMid)
+		}
+		return
+	}
+
+	if hasUnder && !hasOver {
+		underPos := s.RiskManager.GetPositionByToken(tracked.TokenPair.No)[0]
+		if underPos.EntryPrice+overAsk <= maxSpread {
+			log.Printf("O/U: 🍖 HEDGE ARB - %s (Under @ %.4f + Over Ask @ %.4f = %.4f)",
+				tracked.TotalLine, underPos.EntryPrice, overAsk, underPos.EntryPrice+overAsk)
+			s.executeSecondLeg(tracked, "OVER", tracked.TokenPair.Yes, overAsk, tracked.OverMid)
+		}
+		return
+	}
+
+	// === 3. FIRST LEG / ENTRY ===
+	// Only enter if we hold nothing and find a good value
+	if !hasOver && !hasUnder {
+		// Prefer the cheaper side that meets thresholds
+		if overAsk <= MaxOverPrice && overAsk < underAsk {
+			log.Printf("O/U: 🎯 ENTRY OVER - %s @ %.4f (mid: %.4f)", tracked.TotalLine, overAsk, tracked.OverMid)
+			s.executeFirstLeg(tracked, "OVER", tracked.TokenPair.Yes, overAsk, tracked.OverMid)
+		} else if underAsk <= MaxUnderPrice {
+			log.Printf("O/U: 🎯 ENTRY UNDER - %s @ %.4f (mid: %.4f)", tracked.TotalLine, underAsk, tracked.UnderMid)
+			s.executeFirstLeg(tracked, "UNDER", tracked.TokenPair.No, underAsk, tracked.UnderMid)
+		}
 	}
 }
 
-func (s *Strategy) executeDeltaNeutralEntry(tracked *TrackedMarket) {
+// executeSpreadArb executes a full spread arbitrage (both legs immediately)
+// Uses EQUAL SHARE QUANTITIES to ensure guaranteed risk-free profit
+func (s *Strategy) executeSpreadArb(tracked *TrackedMarket) {
+	overPrice := tracked.OverAsk
+	underPrice := tracked.UnderAsk
+
+	// Calculate sizes - EQUAL SHARE QUANTITIES
 	maxCost := s.Config.MaxPositionSize
 	halfCost := maxCost / 2
 
-	overSize := halfCost / tracked.OverAsk
-	underSize := halfCost / tracked.UnderAsk
+	overSharesMax := halfCost / overPrice
+	underSharesMax := halfCost / underPrice
 
-	totalCost := (tracked.OverAsk * overSize) + (tracked.UnderAsk * underSize)
+	shareQty := overSharesMax
+	if underSharesMax < overSharesMax {
+		shareQty = underSharesMax
+	}
 
-	if err := s.RiskManager.CheckEntry(tracked.TokenPair.Yes, tracked.OverAsk, overSize); err != nil {
+	overCost := shareQty * overPrice
+	underCost := shareQty * underPrice
+	totalCost := overCost + underCost
+
+	// Payout is exactly 1 share size, since exactly one side wins
+	potentialPayout := shareQty
+	fees := totalCost * s.Config.TradingFeePercent
+	guaranteedProfit := potentialPayout - totalCost - fees
+	profitPercent := guaranteedProfit / totalCost
+
+	if profitPercent < s.Config.MinProfitAfterFees {
+		log.Printf("O/U: SKIP spread arb - profit %.2f%% below min %.2f%% (fees: $%.4f)",
+			profitPercent*100, s.Config.MinProfitAfterFees*100, fees)
+		return
+	}
+
+	if guaranteedProfit <= 0 {
+		return
+	}
+
+	// Risk check
+	if err := s.RiskManager.CheckEntry(tracked.TokenPair.Yes, overPrice, shareQty); err != nil {
 		log.Printf("O/U: Risk check failed: %v", err)
 		return
 	}
 
 	if s.Config.IsDryRun() {
-		log.Printf("O/U: [DRY RUN] DELTA NEUTRAL ENTRY")
-		log.Printf("  BUY OVER @ %.4f (size: %.2f, cost: $%.2f)", tracked.OverAsk, overSize, tracked.OverAsk*overSize)
-		log.Printf("  BUY UNDER @ %.4f (size: %.2f, cost: $%.2f)", tracked.UnderAsk, underSize, tracked.UnderAsk*underSize)
-		log.Printf("  Total cost: $%.2f", totalCost)
+		log.Printf("O/U: [DRY RUN] SPREAD ARB (Equal shares: %.2f)", shareQty)
+		log.Printf("  OVER @ %.4f × %.2f shares = $%.2f", overPrice, shareQty, overCost)
+		log.Printf("  UNDER @ %.4f × %.2f shares = $%.2f", underPrice, shareQty, underCost)
+		log.Printf("  Total cost: $%.2f, Guaranteed profit: $%.4f (%.2f%%)",
+			totalCost, guaranteedProfit, profitPercent*100)
 	} else {
+		// Execute both orders
 		_, err := s.ClobClient.CreateOrder(clob.CreateOrderRequest{
 			TokenID:   tracked.TokenPair.Yes,
-			Price:     tracked.OverAsk,
-			Size:      overSize,
+			Price:     overPrice,
+			Size:      shareQty,
 			Side:      clob.Buy,
 			OrderType: clob.Limit,
 		})
@@ -401,8 +497,8 @@ func (s *Strategy) executeDeltaNeutralEntry(tracked *TrackedMarket) {
 
 		_, err = s.ClobClient.CreateOrder(clob.CreateOrderRequest{
 			TokenID:   tracked.TokenPair.No,
-			Price:     tracked.UnderAsk,
-			Size:      underSize,
+			Price:     underPrice,
+			Size:      shareQty,
 			Side:      clob.Buy,
 			OrderType: clob.Limit,
 		})
@@ -416,13 +512,13 @@ func (s *Strategy) executeDeltaNeutralEntry(tracked *TrackedMarket) {
 		MarketID:     tracked.Market.ID,
 		TokenID:      tracked.TokenPair.Yes,
 		OutcomeName:  fmt.Sprintf("OVER %s", tracked.TotalLine),
-		Size:         overSize,
-		EntryPrice:   tracked.OverMid,
-		CurrentPrice: tracked.OverMid,
+		Size:         shareQty,
+		EntryPrice:   overPrice,
+		CurrentPrice: overPrice,
 		Side:         "BUY",
-		Type:         risk.TypeDeltaNeutral,
+		Type:         risk.TypeArbitrage,
 		Strategy:     "overunder",
-		TotalCost:    totalCost,
+		TotalCost:    overCost,
 	}
 	overID := s.RiskManager.AddPosition(overPos)
 
@@ -430,13 +526,13 @@ func (s *Strategy) executeDeltaNeutralEntry(tracked *TrackedMarket) {
 		MarketID:         tracked.Market.ID,
 		TokenID:          tracked.TokenPair.No,
 		OutcomeName:      fmt.Sprintf("UNDER %s", tracked.TotalLine),
-		Size:             underSize,
-		EntryPrice:       tracked.UnderMid,
-		CurrentPrice:     tracked.UnderMid,
+		Size:             shareQty,
+		EntryPrice:       underPrice,
+		CurrentPrice:     underPrice,
 		Side:             "BUY",
-		Type:             risk.TypeDeltaNeutral,
+		Type:             risk.TypeArbitrage,
 		Strategy:         "overunder",
-		TotalCost:        totalCost,
+		TotalCost:        underCost,
 		PairedPositionID: overID,
 	}
 	underID := s.RiskManager.AddPosition(underPos)
@@ -446,7 +542,116 @@ func (s *Strategy) executeDeltaNeutralEntry(tracked *TrackedMarket) {
 	}
 
 	tracked.HasPosition = true
-	log.Printf("O/U: ✅ Delta neutral position opened - Total cost: $%.2f", totalCost)
+	log.Printf("O/U: ✅ Spread arb position opened - Guaranteed profit: $%.4f", guaranteedProfit)
+}
+
+func (s *Strategy) executeFirstLeg(tracked *TrackedMarket, sideName string, tokenID string, ask float64, mid float64) {
+	maxCost := s.Config.MaxPositionSize / 2 // Reserve half for second leg
+	size := maxCost / ask
+	totalCost := size * ask
+
+	if err := s.RiskManager.CheckEntry(tokenID, ask, size); err != nil {
+		log.Printf("O/U: Risk check failed: %v", err)
+		return
+	}
+
+	if s.Config.IsDryRun() {
+		log.Printf("O/U: [DRY RUN] LEG-IN ENTRY")
+		log.Printf("  BUY %s @ %.4f (size: %.2f, cost: $%.2f)", sideName, ask, size, totalCost)
+	} else {
+		_, err := s.ClobClient.CreateOrder(clob.CreateOrderRequest{
+			TokenID:   tokenID,
+			Price:     ask,
+			Size:      size,
+			Side:      clob.Buy,
+			OrderType: clob.Limit,
+		})
+		if err != nil {
+			log.Printf("O/U: %s order failed: %v", sideName, err)
+			return
+		}
+	}
+
+	pos := &risk.Position{
+		MarketID:     tracked.Market.ID,
+		TokenID:      tokenID,
+		OutcomeName:  fmt.Sprintf("%s %s", sideName, tracked.TotalLine),
+		Size:         size,
+		EntryPrice:   mid,
+		CurrentPrice: mid,
+		Side:         "BUY",
+		Type:         risk.TypeValueBet,
+		Strategy:     "overunder",
+		TotalCost:    totalCost,
+	}
+	s.RiskManager.AddPosition(pos)
+
+	tracked.HasPosition = true
+	log.Printf("O/U: ✅ Single-side position opened - Cost: $%.2f", totalCost)
+}
+
+func (s *Strategy) executeSecondLeg(tracked *TrackedMarket, sideName string, tokenID string, ask float64, mid float64) {
+	maxCost := s.Config.MaxPositionSize / 2
+	size := maxCost / ask
+	totalCost := size * ask
+
+	if err := s.RiskManager.CheckEntry(tokenID, ask, size); err != nil {
+		log.Printf("O/U: Risk check failed for second leg: %v", err)
+		return
+	}
+
+	if s.Config.IsDryRun() {
+		log.Printf("O/U: [DRY RUN] HEDGE ARB ENTRY")
+		log.Printf("  BUY %s @ %.4f (size: %.2f, cost: $%.2f)", sideName, ask, size, totalCost)
+	} else {
+		_, err := s.ClobClient.CreateOrder(clob.CreateOrderRequest{
+			TokenID:   tokenID,
+			Price:     ask,
+			Size:      size,
+			Side:      clob.Buy,
+			OrderType: clob.Limit,
+		})
+		if err != nil {
+			log.Printf("O/U: Second leg order failed: %v", err)
+			return
+		}
+	}
+
+	pos := &risk.Position{
+		MarketID:     tracked.Market.ID,
+		TokenID:      tokenID,
+		OutcomeName:  fmt.Sprintf("%s %s", sideName, tracked.TotalLine),
+		Size:         size,
+		EntryPrice:   mid,
+		CurrentPrice: mid,
+		Side:         "BUY",
+		Type:         risk.TypeArbitrage, // It's complete risk-free arb now
+		Strategy:     "overunder",
+		TotalCost:    totalCost,
+	}
+	newID := s.RiskManager.AddPosition(pos)
+
+	// Link positions
+	var otherSideToken string
+	if tokenID == tracked.TokenPair.Yes {
+		otherSideToken = tracked.TokenPair.No
+	} else {
+		otherSideToken = tracked.TokenPair.Yes
+	}
+
+	if existingPositions := s.RiskManager.GetPositionByToken(otherSideToken); len(existingPositions) > 0 {
+		existing := existingPositions[0]
+		existing.PairedPositionID = newID
+
+		if newPos := s.RiskManager.GetPosition(newID); newPos != nil {
+			newPos.PairedPositionID = existing.ID
+		}
+
+		// Upgrade existing to Arbitrage
+		existing.Type = risk.TypeArbitrage
+	}
+
+	log.Printf("O/U: ✅ Second leg (HEDGE) filled - Arb secured!")
 }
 
 func (s *Strategy) checkExitsForDeltaNeutral(tracked *TrackedMarket, now time.Time) {
@@ -564,11 +769,4 @@ func truncateQuestion(q string) string {
 		return q[:57] + "..."
 	}
 	return q
-}
-
-func (s *Strategy) GetStatus() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	openPositions := len(s.RiskManager.GetPositionsByStrategy("overunder"))
-	return fmt.Sprintf("O/U: %d markets, %d positions", len(s.trackedMarkets), openPositions)
 }

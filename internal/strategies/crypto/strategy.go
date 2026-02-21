@@ -8,6 +8,7 @@ import (
 	"polymarket-bot/internal/clients/clob"
 	"polymarket-bot/internal/clients/gamma"
 	"polymarket-bot/internal/risk"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -249,7 +250,6 @@ func (s *Strategy) isCryptoEvent(event gamma.Event) bool {
 }
 
 // isShortTermMarket checks if a market is a short-term prediction
-// STRICT FILTERING: Only 15min, 1hr, or 4hr markets
 func (s *Strategy) isShortTermMarket(market gamma.Market) bool {
 	// Parse end time to check duration
 	endTime, err := time.Parse(time.RFC3339, market.EndDateIso)
@@ -264,17 +264,10 @@ func (s *Strategy) isShortTermMarket(market gamma.Market) bool {
 	// Calculate time until expiry
 	timeUntilExpiry := time.Until(endTime)
 
-	// STRICT TIME WINDOWS for short-term crypto trading
-	// 15-minute window: 5-20 minutes (allows some buffer for entry/exit)
-	is15Min := timeUntilExpiry <= 20*time.Minute
-
-	// 1-hour window: 40-80 minutes
-	is1Hr := timeUntilExpiry >= 40*time.Minute && timeUntilExpiry <= 80*time.Minute
-
-	// 4-hour window: 3-5 hours
-	is4Hr := timeUntilExpiry >= 3*time.Hour && timeUntilExpiry <= 5*time.Hour
-
-	return is15Min || is1Hr || is4Hr
+	// RELAXED FILTERING: Allow any market expiring within 12 hours
+	// This ensures we actually pick up markets and don't stall.
+	// The analysis logic will still prioritize closer markets.
+	return timeUntilExpiry > 0 && timeUntilExpiry <= 12*time.Hour
 }
 
 // hasShortTermIndicators checks if question contains time-related phrases
@@ -354,91 +347,101 @@ func (s *Strategy) updatePricesAndTrade() {
 		if s.RiskManager.HasPositionForMarket(marketID) {
 			s.checkExitsForCrypto(tracked, now)
 		}
+	}
 
-		// Skip if already has position (check again after potential exits)
-		if s.RiskManager.HasPositionForMarket(marketID) {
-			// Check for second leg opportunity if first leg is filled
-			if tracked.LegInfo != nil && tracked.LegInfo.FirstLegFilled && !tracked.LegInfo.SecondLegPlaced {
-				s.checkSecondLeg(tracked)
-			}
+	// === PRIORITY RANKING FOR ENTRIES ===
+	// We want to sort markets so we check the most profitable ones first
+	var rankedMarkets []*TrackedCryptoMarket
+
+	s.mu.RLock()
+	for _, tracked := range s.trackedMarkets {
+		// Skip if too close to expiry (already handled above, but re-checked)
+		timeLeft := tracked.EndTime.Sub(now)
+		if timeLeft < time.Duration(s.Config.CryptoMinTimeLeft)*time.Second {
 			continue
 		}
 
+		// Check for second leg opportunity if first leg is filled
+		// Handled gracefully below inside analyzeAndTrade now
+
+		if tracked.YesPrice > 0 && tracked.NoPrice > 0 {
+			rankedMarkets = append(rankedMarkets, tracked)
+		}
+	}
+	s.mu.RUnlock()
+
+	// Sort explicitly by potential arbitrage spread (YesAsk + NoAsk) ascending
+	// Smaller Spread = better arbitrage
+	sort.Slice(rankedMarkets, func(i, j int) bool {
+		return rankedMarkets[i].Spread < rankedMarkets[j].Spread
+	})
+
+	// Now try to enter trades in order of profitability
+	for _, tracked := range rankedMarkets {
 		// Look for arbitrage opportunity
 		s.analyzeAndTrade(tracked)
 	}
 }
 
-// analyzeAndTrade analyzes a market and executes trades if opportunity found
 func (s *Strategy) analyzeAndTrade(tracked *TrackedCryptoMarket) {
 	cheapThreshold := s.Config.CryptoCheapThreshold
 	maxSpread := s.Config.CryptoMaxSpread
 
-	// Check if we have room for more crypto positions (max 10 for crypto)
+	// Check if we have room for more crypto positions
 	if !s.RiskManager.CanAddPositionForStrategy("crypto") {
-		return // Max crypto positions reached
+		return
 	}
 
-	// Priority check: BTC and SOL 15-min markets get priority
-	isPriority := (tracked.Symbol == "BTC" || tracked.Symbol == "SOL") &&
-		time.Until(tracked.EndTime) <= 30*time.Minute
+	yesAsk, noAsk := tracked.YesPrice, tracked.NoPrice
 
-	// Position slot allocation:
-	// - Slots 0-9 (first 10): Crypto priority (BTC/SOL 15-min)
-	// - Slots 10-19 (next 10): Sports priority
-	// - Slots 20-34 (remaining 15): Open for all (crypto, sports, O/U)
-	// DISABLED FOR DEBUGGING - priority check
-	_ = s.RiskManager.GetOpenPositionCount()
-	_ = isPriority
-	// posCount := s.RiskManager.GetOpenPositionCount()
-	// if posCount >= risk.MaxPositions-5 && !isPriority {
-	// 	return
-	// }
+	hasYes := len(s.RiskManager.GetPositionByToken(tracked.TokenPair.Yes)) > 0
+	hasNo := len(s.RiskManager.GetPositionByToken(tracked.TokenPair.No)) > 0
 
-	// SPREAD ARBITRAGE
-	// If AskYes + AskNo < 1.0 (minus fees), there's guaranteed profit if filled
-	if tracked.Spread < maxSpread && tracked.Spread > 0.10 {
-		log.Printf("Crypto: 💰 SPREAD ARB FOUND - %s (AskYes: %.4f + AskNo: %.4f = %.4f)%s",
-			tracked.Symbol, tracked.YesPrice, tracked.NoPrice, tracked.Spread,
-			func() string {
-				if isPriority {
-					return " ⭐ PRIORITY"
-				} else {
-					return ""
-				}
-			}())
+	// If we already hold both, nothing to do
+	if hasYes && hasNo {
+		return
+	}
 
-		// Buy both sides
+	// === 1. SIMULTANEOUS SPREAD ARBITRAGE (PRIORITY) ===
+	combinedAsk := yesAsk + noAsk
+
+	if combinedAsk > 0 && combinedAsk < maxSpread && !hasYes && !hasNo {
+		log.Printf("Crypto: 💰 SPREAD ARB FOUND - %s (AskYes: %.4f + AskNo: %.4f = %.4f)",
+			tracked.Symbol, yesAsk, noAsk, combinedAsk)
 		s.executeSpreadArb(tracked)
 		return
 	}
 
-	// LEG-IN STRATEGY (The Gabagool)
-	// Buying at different times to maximize arb profit
-	// 1. Buy one side when < 96-98 cents (including fees)
-	// 2. Wait for the other side to dip or be profitable combined
-
-	// Threshold for leg-in (very cheap side)
-	// If one side is < 0.45 and the other is < 0.52 etc (Sum < 0.97)
-
-	// Check YES side for first leg
-	if tracked.YesPrice < cheapThreshold && tracked.YesPrice > 0.10 {
-		// Calculate if second leg would be profitable right NOW
-		// Need AskYes + AskNo < 0.98 for guaranteed arb
-		if tracked.Spread < 0.98 {
-			log.Printf("Crypto: 🍖 GABAGOOL YES - %s YES @ %.4f (Spread: %.4f)",
-				tracked.Symbol, tracked.YesPrice, tracked.Spread)
-			s.executeFirstLeg(tracked, "YES", tracked.TokenPair.Yes, tracked.YesPrice)
+	// === 2. SECOND LEG / HEDGE ===
+	if hasYes && !hasNo {
+		yesPos := s.RiskManager.GetPositionByToken(tracked.TokenPair.Yes)[0]
+		if yesPos.EntryPrice+noAsk <= 0.98 {
+			log.Printf("Crypto: 🍖 HEDGE ARB - %s (YES @ %.4f + NO Ask @ %.4f = %.4f)",
+				tracked.Symbol, yesPos.EntryPrice, noAsk, yesPos.EntryPrice+noAsk)
+			s.executeSecondLeg(tracked, "NO", tracked.TokenPair.No, noAsk, yesPos.EntryPrice)
 		}
 		return
 	}
 
-	// Check NO side for first leg
-	if tracked.NoPrice < cheapThreshold && tracked.NoPrice > 0.10 {
-		if tracked.Spread < 0.98 {
-			log.Printf("Crypto: 🍖 GABAGOOL NO - %s NO @ %.4f (Spread: %.4f)",
-				tracked.Symbol, tracked.NoPrice, tracked.Spread)
-			s.executeFirstLeg(tracked, "NO", tracked.TokenPair.No, tracked.NoPrice)
+	if hasNo && !hasYes {
+		noPos := s.RiskManager.GetPositionByToken(tracked.TokenPair.No)[0]
+		if noPos.EntryPrice+yesAsk <= 0.98 {
+			log.Printf("Crypto: 🍖 HEDGE ARB - %s (NO @ %.4f + YES Ask @ %.4f = %.4f)",
+				tracked.Symbol, noPos.EntryPrice, yesAsk, noPos.EntryPrice+yesAsk)
+			s.executeSecondLeg(tracked, "YES", tracked.TokenPair.Yes, yesAsk, noPos.EntryPrice)
+		}
+		return
+	}
+
+	// === 3. FIRST LEG / ENTRY ===
+	if !hasYes && !hasNo {
+		// Prefer the cheaper side that meets thresholds
+		if yesAsk <= cheapThreshold && yesAsk < noAsk {
+			log.Printf("Crypto: 🎯 ENTRY YES - %s @ %.4f", tracked.Symbol, yesAsk)
+			s.executeFirstLeg(tracked, "YES", tracked.TokenPair.Yes, yesAsk)
+		} else if noAsk <= cheapThreshold {
+			log.Printf("Crypto: 🎯 ENTRY NO - %s @ %.4f", tracked.Symbol, noAsk)
+			s.executeFirstLeg(tracked, "NO", tracked.TokenPair.No, noAsk)
 		}
 	}
 }
@@ -579,24 +582,23 @@ func (s *Strategy) executeSpreadArb(tracked *TrackedCryptoMarket) {
 
 // executeFirstLeg executes the first leg of a leg-in arbitrage
 // Tracks accumulated costs for asymmetric buying (Gabagool strategy)
-func (s *Strategy) executeFirstLeg(tracked *TrackedCryptoMarket, side string, tokenID string, price float64) {
+func (s *Strategy) executeFirstLeg(tracked *TrackedCryptoMarket, sideName string, tokenID string, ask float64) {
 	maxCost := s.Config.MaxPositionSize / 2 // Reserve half for second leg
-	size := maxCost / price
-	cost := size * price
+	size := maxCost / ask
+	totalCost := size * ask
 
-	// Risk check
-	if err := s.RiskManager.CheckEntry(tokenID, price, size); err != nil {
+	if err := s.RiskManager.CheckEntry(tokenID, ask, size); err != nil {
 		log.Printf("Crypto: Risk check failed for first leg: %v", err)
 		return
 	}
 
 	if s.Config.IsDryRun() {
-		log.Printf("Crypto: [DRY RUN] First leg %s %s @ %.4f × %.2f shares = $%.2f",
-			side, tracked.Symbol, price, size, cost)
+		log.Printf("Crypto: [DRY RUN] LEG-IN ENTRY")
+		log.Printf("  BUY %s @ %.4f (size: %.2f, cost: $%.2f)", sideName, ask, size, totalCost)
 	} else {
 		_, err := s.ClobClient.CreateOrder(clob.CreateOrderRequest{
 			TokenID:   tokenID,
-			Price:     price,
+			Price:     ask,
 			Size:      size,
 			Side:      clob.Buy,
 			OrderType: clob.Limit,
@@ -607,100 +609,41 @@ func (s *Strategy) executeFirstLeg(tracked *TrackedCryptoMarket, side string, to
 		}
 	}
 
-	// Track leg info with accumulated costs
-	tracked.LegInfo = &LegInfo{
-		FirstLegSide:   side,
-		FirstLegPrice:  price,
-		FirstLegSize:   size,
-		FirstLegFilled: true, // Assume filled for simplicity (TODO: check order status)
-	}
-
-	// Initialize accumulated tracking based on which side we bought
-	if side == "YES" {
-		tracked.LegInfo.YesAccumulatedCost = cost
-		tracked.LegInfo.YesAccumulatedShares = size
-	} else {
-		tracked.LegInfo.NoAccumulatedCost = cost
-		tracked.LegInfo.NoAccumulatedShares = size
-	}
-
-	// Track position
 	pos := &risk.Position{
 		MarketID:     tracked.Market.ID,
 		TokenID:      tokenID,
-		OutcomeName:  side,
+		OutcomeName:  sideName,
 		Size:         size,
-		EntryPrice:   price,
-		CurrentPrice: price,
+		EntryPrice:   ask,
+		CurrentPrice: ask,
 		Side:         "BUY",
-		Type:         risk.TypeArbitrage,
+		Type:         risk.TypeValueBet,
 		Strategy:     "crypto",
-		TotalCost:    cost,
+		TotalCost:    totalCost,
 	}
 	s.RiskManager.AddPosition(pos)
-	tracked.HasPosition = true
 
-	log.Printf("Crypto: First leg %s executed - %.2f shares @ $%.4f = $%.2f", side, size, price, cost)
+	tracked.HasPosition = true
+	log.Printf("Crypto: ✅ First leg %s executed - %.2f shares @ $%.4f = $%.2f", sideName, size, ask, totalCost)
 }
 
-// checkSecondLeg checks if second leg should be placed
-// Uses average cost calculation for asymmetric buying (Gabagool strategy)
-func (s *Strategy) checkSecondLeg(tracked *TrackedCryptoMarket) {
-	if tracked.LegInfo == nil || tracked.LegInfo.SecondLegPlaced {
+func (s *Strategy) executeSecondLeg(tracked *TrackedCryptoMarket, sideName string, tokenID string, ask float64, firstLegEntry float64) {
+	maxCost := s.Config.MaxPositionSize / 2
+	size := maxCost / ask
+	totalCost := size * ask
+
+	if err := s.RiskManager.CheckEntry(tokenID, ask, size); err != nil {
+		log.Printf("Crypto: Risk check failed for second leg: %v", err)
 		return
 	}
-
-	// Determine second leg details
-	var secondTokenID string
-	var secondPrice float64
-	var secondSide string
-
-	if tracked.LegInfo.FirstLegSide == "YES" {
-		secondTokenID = tracked.TokenPair.No
-		secondPrice = tracked.NoPrice
-		secondSide = "NO"
-	} else {
-		secondTokenID = tracked.TokenPair.Yes
-		secondPrice = tracked.YesPrice
-		secondSide = "YES"
-	}
-
-	// Match first leg size for equal quantities
-	size := tracked.LegInfo.FirstLegSize
-	secondCost := size * secondPrice
-
-	// Calculate avg cost per share for completed arb (Gabagool formula)
-	// avgYesCost + avgNoCost < $1.00 = guaranteed profit
-	var avgYesCost, avgNoCost float64
-	if tracked.LegInfo.FirstLegSide == "YES" {
-		avgYesCost = tracked.LegInfo.FirstLegPrice // First leg YES price
-		avgNoCost = secondPrice                    // Second leg NO price
-	} else {
-		avgYesCost = secondPrice                  // Second leg YES price
-		avgNoCost = tracked.LegInfo.FirstLegPrice // First leg NO price
-	}
-
-	combinedCostPerShare := avgYesCost + avgNoCost
-
-	// Need combined cost < $0.98 to account for fees (2% buffer)
-	if combinedCostPerShare >= 0.98 {
-		// Not profitable enough, skip for now
-		return
-	}
-
-	profitPerShare := 1.0 - combinedCostPerShare
-	totalProfit := profitPerShare * size
 
 	if s.Config.IsDryRun() {
-		log.Printf("Crypto: [DRY RUN] Second leg %s %s @ %.4f × %.2f shares",
-			secondSide, tracked.Symbol, secondPrice, size)
-		log.Printf("  Combined cost per share: $%.4f (YES: $%.4f + NO: $%.4f)",
-			combinedCostPerShare, avgYesCost, avgNoCost)
-		log.Printf("  Guaranteed profit: $%.4f (%.2f%% per share)", totalProfit, profitPerShare*100)
+		log.Printf("Crypto: [DRY RUN] HEDGE ARB ENTRY")
+		log.Printf("  BUY %s @ %.4f (size: %.2f, cost: $%.2f)", sideName, ask, size, totalCost)
 	} else {
 		_, err := s.ClobClient.CreateOrder(clob.CreateOrderRequest{
-			TokenID:   secondTokenID,
-			Price:     secondPrice,
+			TokenID:   tokenID,
+			Price:     ask,
 			Size:      size,
 			Side:      clob.Buy,
 			OrderType: clob.Limit,
@@ -711,35 +654,41 @@ func (s *Strategy) checkSecondLeg(tracked *TrackedCryptoMarket) {
 		}
 	}
 
-	tracked.LegInfo.SecondLegPlaced = true
-	tracked.LegInfo.TotalCost = combinedCostPerShare
-
-	// Update accumulated tracking
-	if secondSide == "YES" {
-		tracked.LegInfo.YesAccumulatedCost += secondCost
-		tracked.LegInfo.YesAccumulatedShares += size
-	} else {
-		tracked.LegInfo.NoAccumulatedCost += secondCost
-		tracked.LegInfo.NoAccumulatedShares += size
-	}
-
-	// Track second position
 	pos := &risk.Position{
 		MarketID:     tracked.Market.ID,
-		TokenID:      secondTokenID,
-		OutcomeName:  secondSide,
+		TokenID:      tokenID,
+		OutcomeName:  sideName,
 		Size:         size,
-		EntryPrice:   secondPrice,
-		CurrentPrice: secondPrice,
+		EntryPrice:   ask,
+		CurrentPrice: ask,
 		Side:         "BUY",
 		Type:         risk.TypeArbitrage,
 		Strategy:     "crypto",
-		TotalCost:    secondCost,
+		TotalCost:    totalCost,
 	}
-	s.RiskManager.AddPosition(pos)
+	newID := s.RiskManager.AddPosition(pos)
 
-	log.Printf("Crypto: Second leg completed - combined cost: $%.4f/share, locked profit: $%.4f",
-		combinedCostPerShare, totalProfit)
+	// Link positions
+	var otherSideToken string
+	if tokenID == tracked.TokenPair.Yes {
+		otherSideToken = tracked.TokenPair.No
+	} else {
+		otherSideToken = tracked.TokenPair.Yes
+	}
+
+	if existingPositions := s.RiskManager.GetPositionByToken(otherSideToken); len(existingPositions) > 0 {
+		existing := existingPositions[0]
+		existing.PairedPositionID = newID
+
+		if newPos := s.RiskManager.GetPosition(newID); newPos != nil {
+			newPos.PairedPositionID = existing.ID
+		}
+
+		// Upgrade existing to Arbitrage
+		existing.Type = risk.TypeArbitrage
+	}
+
+	log.Printf("Crypto: ✅ Second leg (HEDGE) filled - Arb secured!")
 }
 
 // Minimum time before expiry to force exit (30 seconds before market closes)
@@ -858,13 +807,12 @@ func (s *Strategy) checkExitsForCrypto(tracked *TrackedCryptoMarket, now time.Ti
 
 		// SCALPING LOGIC (requested)
 		// If we are in the first leg of a leg-in and it's very profitable, SCALP it
-		if tracked.LegInfo != nil && !tracked.LegInfo.SecondLegPlaced && pos.ID != "" {
+		if pos.Type == risk.TypeValueBet && pos.PairedPositionID == "" {
 			// If pnl is > 20% on the first leg, just scalp it and move on
 			if pnlPercent >= 0.20 {
 				log.Printf("Crypto: ✂️ SCALPING leg-in %s @ %.4f (+%.1f%%)",
 					pos.OutcomeName, currentPrice, pnlPercent*100)
 				s.executeExit(pos)
-				tracked.LegInfo = nil // Reset leg info
 			}
 		}
 
