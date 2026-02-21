@@ -264,10 +264,10 @@ func (s *Strategy) isShortTermMarket(market gamma.Market) bool {
 	// Calculate time until expiry
 	timeUntilExpiry := time.Until(endTime)
 
-	// RELAXED FILTERING: Allow any market expiring within 12 hours
-	// This ensures we actually pick up markets and don't stall.
-	// The analysis logic will still prioritize closer markets.
-	return timeUntilExpiry > 0 && timeUntilExpiry <= 12*time.Hour
+	// RELAXED FILTERING: Allow any market expiring within 3 hours
+	// This ensures we pick up immediate markets without overloading the API with 600+ markets.
+	// The analysis logic will still prioritize closer markets down to the 120s limit.
+	return timeUntilExpiry > 0 && timeUntilExpiry <= 3*time.Hour
 }
 
 // hasShortTermIndicators checks if question contains time-related phrases
@@ -309,68 +309,61 @@ func (s *Strategy) detectSymbol(question string) string {
 
 // updatePricesAndTrade fetches prices and looks for arbitrage opportunities
 func (s *Strategy) updatePricesAndTrade() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	now := time.Now()
 
-	for marketID, tracked := range s.trackedMarkets {
-		// Skip if too close to expiry
-		timeLeft := tracked.EndTime.Sub(now)
-		if timeLeft < time.Duration(s.Config.CryptoMinTimeLeft)*time.Second {
-			continue
-		}
-
-		// Fetch real prices from CLOB
-		// For buying (entry), we need the ASK price (what sellers want)
-		// For selling (exit), we need the BID price (what buyers want)
-		yesAsk, yesAskErr := s.ClobClient.GetBestAsk(tracked.TokenPair.Yes)
-		noAsk, noAskErr := s.ClobClient.GetBestAsk(tracked.TokenPair.No)
-
-		yesBid, yesBidErr := s.ClobClient.GetBestBid(tracked.TokenPair.Yes)
-		noBid, noBidErr := s.ClobClient.GetBestBid(tracked.TokenPair.No)
-
-		if yesAskErr != nil || noAskErr != nil || yesBidErr != nil || noBidErr != nil {
-			continue
-		}
-
-		tracked.YesPrice = yesAsk // Entry price is Ask
-		tracked.NoPrice = noAsk   // Entry price is Ask
-		tracked.Spread = yesAsk + noAsk
-		tracked.LastUpdate = now
-
-		// Update risk manager with BID prices for existing positions (current exit value)
-		s.RiskManager.UpdatePrice(tracked.TokenPair.Yes, yesBid)
-		s.RiskManager.UpdatePrice(tracked.TokenPair.No, noBid)
-
-		// Check for exits on existing positions (stop loss, take profit, or near-expiry)
-		if s.RiskManager.HasPositionForMarket(marketID) {
-			s.checkExitsForCrypto(tracked, now)
-		}
-	}
-
-	// === PRIORITY RANKING FOR ENTRIES ===
-	// We want to sort markets so we check the most profitable ones first
-	var rankedMarkets []*TrackedCryptoMarket
-
+	// 1. Snapshot markets to avoid holding lock during HTTP calls
 	s.mu.RLock()
+	marketsToCheck := make([]*TrackedCryptoMarket, 0, len(s.trackedMarkets))
 	for _, tracked := range s.trackedMarkets {
-		// Skip if too close to expiry (already handled above, but re-checked)
 		timeLeft := tracked.EndTime.Sub(now)
-		if timeLeft < time.Duration(s.Config.CryptoMinTimeLeft)*time.Second {
-			continue
-		}
-
-		// Check for second leg opportunity if first leg is filled
-		// Handled gracefully below inside analyzeAndTrade now
-
-		if tracked.YesPrice > 0 && tracked.NoPrice > 0 {
-			rankedMarkets = append(rankedMarkets, tracked)
+		if timeLeft >= time.Duration(s.Config.CryptoMinTimeLeft)*time.Second {
+			marketsToCheck = append(marketsToCheck, tracked)
 		}
 	}
 	s.mu.RUnlock()
 
-	// Sort explicitly by potential arbitrage spread (YesAsk + NoAsk) ascending
+	// 2. Fetch prices without holding the global lock
+	var rankedMarkets []*TrackedCryptoMarket
+
+	for _, tracked := range marketsToCheck {
+		// Fetch real prices from CLOB
+		yesBook, yesErr := s.ClobClient.GetOrderBookWithPrices(tracked.TokenPair.Yes)
+		noBook, noErr := s.ClobClient.GetOrderBookWithPrices(tracked.TokenPair.No)
+
+		if yesErr != nil || noErr != nil || yesBook == nil || noBook == nil {
+			continue
+		}
+
+		// Read prices (Ask is for entry, Bid is for exit value)
+		yesAsk, yesBid := yesBook.BestAsk, yesBook.BestBid
+		noAsk, noBid := noBook.BestAsk, noBook.BestBid
+
+		if yesAsk <= 0 || noAsk <= 0 {
+			continue
+		}
+
+		s.mu.Lock()
+		tracked.YesPrice = yesAsk
+		tracked.NoPrice = noAsk
+		tracked.Spread = yesAsk + noAsk
+		tracked.LastUpdate = now
+		s.mu.Unlock()
+
+		// Update risk manager with BID prices for existing positions
+		s.RiskManager.UpdatePrice(tracked.TokenPair.Yes, yesBid)
+		s.RiskManager.UpdatePrice(tracked.TokenPair.No, noBid)
+
+		// Check for exits on existing positions
+		if s.RiskManager.HasPositionForMarket(tracked.Market.ID) {
+			s.checkExitsForCrypto(tracked, now)
+		}
+
+		rankedMarkets = append(rankedMarkets, tracked)
+	}
+
+	// === PRIORITY RANKING FOR ENTRIES ===
+	// We want to sort markets so we check the most profitable ones first
+
 	// Smaller Spread = better arbitrage
 	sort.Slice(rankedMarkets, func(i, j int) bool {
 		return rankedMarkets[i].Spread < rankedMarkets[j].Spread
@@ -385,7 +378,6 @@ func (s *Strategy) updatePricesAndTrade() {
 
 func (s *Strategy) analyzeAndTrade(tracked *TrackedCryptoMarket) {
 	cheapThreshold := s.Config.CryptoCheapThreshold
-	maxSpread := s.Config.CryptoMaxSpread
 
 	// Check if we have room for more crypto positions
 	if !s.RiskManager.CanAddPositionForStrategy("crypto") {
@@ -404,12 +396,16 @@ func (s *Strategy) analyzeAndTrade(tracked *TrackedCryptoMarket) {
 
 	// === 1. SIMULTANEOUS SPREAD ARBITRAGE (PRIORITY) ===
 	combinedAsk := yesAsk + noAsk
+	spreadArbThreshold := 0.98 // Required to beat 2% fees
 
-	if combinedAsk > 0 && combinedAsk < maxSpread && !hasYes && !hasNo {
+	if combinedAsk > 0 && combinedAsk < spreadArbThreshold && !hasYes && !hasNo {
 		log.Printf("Crypto: 💰 SPREAD ARB FOUND - %s (AskYes: %.4f + AskNo: %.4f = %.4f)",
 			tracked.Symbol, yesAsk, noAsk, combinedAsk)
-		s.executeSpreadArb(tracked)
-		return
+
+		// If executeSpreadArb returns true, we successfully entered. Otherwise, fall through to single-leg.
+		if s.executeSpreadArb(tracked) {
+			return
+		}
 	}
 
 	// === 2. SECOND LEG / HEDGE ===
@@ -448,7 +444,8 @@ func (s *Strategy) analyzeAndTrade(tracked *TrackedCryptoMarket) {
 
 // executeSpreadArb executes a full spread arbitrage (both legs immediately)
 // Uses EQUAL SHARE QUANTITIES to ensure guaranteed profit (Gabagool strategy)
-func (s *Strategy) executeSpreadArb(tracked *TrackedCryptoMarket) {
+// Returns true if successfully executed or dry-run, false if skipped due to profit/risk checks.
+func (s *Strategy) executeSpreadArb(tracked *TrackedCryptoMarket) bool {
 	yesPrice := tracked.YesPrice
 	noPrice := tracked.NoPrice
 
@@ -484,19 +481,19 @@ func (s *Strategy) executeSpreadArb(tracked *TrackedCryptoMarket) {
 	if profitPercent < s.Config.MinProfitAfterFees {
 		log.Printf("Crypto: SKIP spread arb - profit %.2f%% below min %.2f%% (fees: $%.4f)",
 			profitPercent*100, s.Config.MinProfitAfterFees*100, fees)
-		return
+		return false
 	}
 
 	if guaranteedProfit <= 0 {
 		log.Printf("Crypto: No profit in spread arb (cost: $%.4f, payout: $%.4f, fees: $%.4f)",
 			totalCost, potentialPayout, fees)
-		return
+		return false
 	}
 
 	// Risk check
 	if err := s.RiskManager.CheckEntry(tracked.TokenPair.Yes, yesPrice, shareQty); err != nil {
 		log.Printf("Crypto: Risk check failed: %v", err)
-		return
+		return false
 	}
 
 	if s.Config.IsDryRun() {
@@ -516,7 +513,7 @@ func (s *Strategy) executeSpreadArb(tracked *TrackedCryptoMarket) {
 		})
 		if err != nil {
 			log.Printf("Crypto: YES order failed: %v", err)
-			return
+			return false
 		}
 
 		_, err = s.ClobClient.CreateOrder(clob.CreateOrderRequest{
@@ -528,7 +525,7 @@ func (s *Strategy) executeSpreadArb(tracked *TrackedCryptoMarket) {
 		})
 		if err != nil {
 			log.Printf("Crypto: NO order failed: %v", err)
-			return
+			return false
 		}
 	}
 
@@ -578,6 +575,7 @@ func (s *Strategy) executeSpreadArb(tracked *TrackedCryptoMarket) {
 	}
 
 	log.Printf("Crypto: Spread arb executed - %.2f shares each side, guaranteed profit: $%.4f", shareQty, guaranteedProfit)
+	return true
 }
 
 // executeFirstLeg executes the first leg of a leg-in arbitrage

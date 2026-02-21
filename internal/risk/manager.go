@@ -83,13 +83,18 @@ type Manager struct {
 	StrategyLastTradeTime map[string]time.Time
 }
 
-// NewManager creates a new risk manager
 func NewManager(cfg *config.Config) *Manager {
-	return &Manager{
-		Config:                cfg,
-		Positions:             make(map[string]*Position),
-		StrategyLastTradeTime: make(map[string]time.Time),
+	now := time.Now()
+	m := &Manager{
+		Config:    cfg,
+		Positions: make(map[string]*Position),
+		StrategyLastTradeTime: map[string]time.Time{
+			"crypto":    now,
+			"sports":    now,
+			"overunder": now,
+		},
 	}
+	return m
 }
 
 // GeneratePositionID creates a unique position ID

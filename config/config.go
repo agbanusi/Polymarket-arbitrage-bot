@@ -137,7 +137,7 @@ func LoadConfig() *Config {
 
 		// Crypto Strategy - SHORT-TERM ONLY (15min/1hr/4hr)
 		CryptoEnabled:        getEnvBool("CRYPTO_ENABLED", true),
-		CryptoCheapThreshold: getEnvFloat("CRYPTO_CHEAP_THRESHOLD", 0.45),
+		CryptoCheapThreshold: getEnvFloat("CRYPTO_CHEAP_THRESHOLD", 0.49),
 		CryptoMaxSpread:      getEnvFloat("CRYPTO_MAX_SPREAD", 0.99),
 		CryptoMinTimeLeft:    getEnvInt("CRYPTO_MIN_TIME_LEFT", 120),
 		CryptoSymbols:        getEnvSlice("CRYPTO_SYMBOLS", []string{"BTC", "ETH", "SOL"}),
