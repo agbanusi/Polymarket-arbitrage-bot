@@ -15,6 +15,7 @@ import (
 	"polymarket-bot/internal/clients/rtds"
 	"polymarket-bot/internal/risk"
 	"polymarket-bot/internal/services"
+	"polymarket-bot/internal/strategies/copytrading"
 	"polymarket-bot/internal/strategies/crossarb"
 	"polymarket-bot/internal/strategies/crypto"
 	"polymarket-bot/internal/strategies/overunder"
@@ -82,6 +83,7 @@ func main() {
 	ouStrategy := overunder.NewStrategy(cfg, gammaClient, clobClient, riskManager)
 	cryptoStrategy := crypto.NewStrategy(cfg, gammaClient, clobClient, riskManager)
 	crossArbStrategy := crossarb.NewStrategy(cfg, gammaClient, clobClient, kalshiClient, riskManager)
+	copyTradingStrategy := copytrading.NewStrategy(cfg, gammaClient, clobClient, riskManager)
 
 	// 7. Create context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
@@ -121,11 +123,18 @@ func main() {
 		log.Println("⚪ Cross-platform arbitrage disabled")
 	}
 
+	if cfg.CopyTradingEnabled {
+		go copyTradingStrategy.Run()
+		log.Println("✅ Copy trading strategy started")
+	} else {
+		log.Println("⚪ Copy trading disabled")
+	}
+
 	// 9. Start RTDS message processor (for real-time price updates)
 	go processRTDSUpdates(ctx, rtdsClient, riskManager)
 
 	// 10. Status logging
-	go logPeriodicStatus(ctx, sportsStrategy, ouStrategy, cryptoStrategy, crossArbStrategy, riskManager)
+	go logPeriodicStatus(ctx, sportsStrategy, ouStrategy, cryptoStrategy, crossArbStrategy, copyTradingStrategy, riskManager)
 
 	log.Println("==============================================")
 	log.Println("Bot is now running. Press Ctrl+C to stop.")
@@ -146,6 +155,7 @@ func main() {
 	ouStrategy.Stop()
 	cryptoStrategy.Stop()
 	crossArbStrategy.Stop()
+	copyTradingStrategy.Stop()
 	positionMonitor.Stop()
 	settlementService.Stop()
 
@@ -181,7 +191,7 @@ func processRTDSUpdates(ctx context.Context, client *rtds.Client, rm *risk.Manag
 }
 
 // logPeriodicStatus logs strategy status and detailed position reports every 2 minutes (testing)
-func logPeriodicStatus(ctx context.Context, sportsStrat *sports.Strategy, ouStrat *overunder.Strategy, cryptoStrat *crypto.Strategy, crossArbStrat *crossarb.Strategy, rm *risk.Manager) {
+func logPeriodicStatus(ctx context.Context, sportsStrat *sports.Strategy, ouStrat *overunder.Strategy, cryptoStrat *crypto.Strategy, crossArbStrat *crossarb.Strategy, ctStrat *copytrading.Strategy, rm *risk.Manager) {
 	// Print immediate report after 30 seconds
 	time.Sleep(30 * time.Second)
 	log.Println("=== INITIAL STATUS REPORT ===")
@@ -189,6 +199,7 @@ func logPeriodicStatus(ctx context.Context, sportsStrat *sports.Strategy, ouStra
 	log.Println(ouStrat.GetStatus())
 	log.Println(cryptoStrat.GetStatus())
 	log.Println(crossArbStrat.GetStatus())
+	log.Println(ctStrat.GetStatus())
 	log.Print(rm.GetDetailedReport())
 	log.Println("=============================")
 
@@ -205,6 +216,7 @@ func logPeriodicStatus(ctx context.Context, sportsStrat *sports.Strategy, ouStra
 			log.Println(ouStrat.GetStatus())
 			log.Println(cryptoStrat.GetStatus())
 			log.Println(crossArbStrat.GetStatus())
+			log.Println(ctStrat.GetStatus())
 			log.Print(rm.GetDetailedReport())
 			log.Println("==============================")
 		}

@@ -28,10 +28,11 @@ const (
 
 // Position limits
 const (
-	MaxPositions         = 30               // Total max positions across all strategies
+	MaxPositions         = 40               // Total max positions across all strategies
 	BaseCryptoPositions  = 5                // Base limit for crypto
 	BaseSportsPositions  = 15               // Base limit for sports
 	BaseOUPositions      = 10               // Base limit for over/under
+	BaseCopyTradingPos   = 10               // Base limit for copy trading
 	MaxCrossArbPositions = 10               // Cross-platform arb positions
 	IdleSlotTime         = 30 * time.Minute // Time before unused slots become "free"
 )
@@ -89,9 +90,10 @@ func NewManager(cfg *config.Config) *Manager {
 		Config:    cfg,
 		Positions: make(map[string]*Position),
 		StrategyLastTradeTime: map[string]time.Time{
-			"crypto":    now,
-			"sports":    now,
-			"overunder": now,
+			"crypto":      now,
+			"sports":      now,
+			"overunder":   now,
+			"copytrading": now,
 		},
 	}
 	return m
@@ -187,9 +189,10 @@ func (m *Manager) CanAddPositionForStrategy(strategy string) bool {
 
 	// Calculate base allocations
 	baseAllocations := map[string]int{
-		"crypto":    BaseCryptoPositions,
-		"sports":    BaseSportsPositions,
-		"overunder": BaseOUPositions,
+		"crypto":      BaseCryptoPositions,
+		"sports":      BaseSportsPositions,
+		"overunder":   BaseOUPositions,
+		"copytrading": BaseCopyTradingPos,
 	}
 
 	baseLimit := baseAllocations[strategy]
@@ -543,6 +546,7 @@ func (m *Manager) GetDetailedReport() string {
 	cryptoPositions := []*Position{}
 	sportsPositions := []*Position{}
 	ouPositions := []*Position{}
+	ctPositions := []*Position{}
 
 	totalPnL := 0.0
 	totalExposure := 0.0
@@ -558,6 +562,8 @@ func (m *Manager) GetDetailedReport() string {
 			sportsPositions = append(sportsPositions, pos)
 		case "overunder":
 			ouPositions = append(ouPositions, pos)
+		case "copytrading":
+			ctPositions = append(ctPositions, pos)
 		}
 
 		exposure := pos.EntryPrice * pos.Size
@@ -621,9 +627,26 @@ func (m *Manager) GetDetailedReport() string {
 		}
 	}
 
+	// Copy trading positions
+	if len(ctPositions) > 0 {
+		report += "╟────────────────────────────────────────────────────────────────────╢\n"
+		report += fmt.Sprintf("║ 📋 COPY TRADING (%d positions)                                    ║\n", len(ctPositions))
+		report += "╟────────────────────────────────────────────────────────────────────╢\n"
+		for _, pos := range ctPositions {
+			pnl := (pos.CurrentPrice - pos.EntryPrice) * pos.Size
+			pnlPercent := (pos.CurrentPrice - pos.EntryPrice) / pos.EntryPrice * 100
+			symbol := "▲"
+			if pnl < 0 {
+				symbol = "▼"
+			}
+			report += fmt.Sprintf("║  %-15s Entry: $%.4f → $%.4f  %s $%.2f (%.1f%%)\n",
+				truncateStr(pos.OutcomeName, 15), pos.EntryPrice, pos.CurrentPrice, symbol, pnl, pnlPercent)
+		}
+	}
+
 	// Summary
 	report += "╠════════════════════════════════════════════════════════════════════╣\n"
-	totalPositions := len(cryptoPositions) + len(sportsPositions) + len(ouPositions)
+	totalPositions := len(cryptoPositions) + len(sportsPositions) + len(ouPositions) + len(ctPositions)
 	pnlSymbol := "📈"
 	if totalPnL < 0 {
 		pnlSymbol = "📉"

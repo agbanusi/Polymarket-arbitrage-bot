@@ -52,6 +52,12 @@ type Config struct {
 	CryptoSymbols        []string // BTC, ETH, SOL
 	CryptoTimeWindows    []string // Time windows to trade: "15min", "1hr", "4hr"
 
+	// Copy Trading Strategy
+	CopyTradingEnabled      bool
+	CopyTradingMaxPositions int
+	CopyTradingMinTradeSize float64 // Minimum trade size to copy (ignore dust)
+	CopyTradingMaxSlippage  float64 // Max % acceptable slippage from copied trade
+
 	// Sports Live Game Settings
 	SportsLiveGameOnly    bool    // Only trade during live games
 	SportsOddsShiftMin    float64 // Min odds shift to trigger entry (e.g., 0.10 = 10%)
@@ -143,6 +149,12 @@ func LoadConfig() *Config {
 		CryptoSymbols:        getEnvSlice("CRYPTO_SYMBOLS", []string{"BTC", "ETH", "SOL"}),
 		CryptoTimeWindows:    getEnvSlice("CRYPTO_TIME_WINDOWS", []string{"15min", "1hr", "4hr"}),
 
+		// Copy Trading Strategy
+		CopyTradingEnabled:      getEnvBool("COPYTRADING_ENABLED", true),
+		CopyTradingMaxPositions: getEnvInt("COPYTRADING_MAX_POSITIONS", 10),
+		CopyTradingMinTradeSize: getEnvFloat("COPYTRADING_MIN_TRADE_SIZE", 50.0),
+		CopyTradingMaxSlippage:  getEnvFloat("COPYTRADING_MAX_SLIPPAGE", 0.03), // 3%
+
 		// Sports Live Game Settings
 		SportsLiveGameOnly:    getEnvBool("SPORTS_LIVE_GAME_ONLY", true),
 		SportsOddsShiftMin:    getEnvFloat("SPORTS_ODDS_SHIFT_MIN", 0.10),
@@ -196,6 +208,8 @@ func (c *Config) LogConfig() {
 		c.SportsEnabled, c.SportsEntryThreshold, c.SportsExitTarget, c.SportsTags)
 	log.Printf("Crypto Enabled: %v (Threshold: %.2f, Symbols: %v)",
 		c.CryptoEnabled, c.CryptoCheapThreshold, c.CryptoSymbols)
+	log.Printf("CopyTrading Enabled: %v (Max Positions: %d, Min Trade Size: $%.2f)",
+		c.CopyTradingEnabled, c.CopyTradingMaxPositions, c.CopyTradingMinTradeSize)
 	log.Println("=========================")
 }
 
